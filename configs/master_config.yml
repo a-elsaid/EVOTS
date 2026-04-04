@@ -34,8 +34,8 @@ data:
     # - headerless files: use_col_indices=True and date_col="0" (or set it to the index as string)
     date_col: null # e.g. "date" or "0" or null to disable
 eval:
-  training_steps: 5
-  extra_training_steps: 20
+  training_steps: 20
+  extra_training_steps: 2000
   early_stopping: true
   early_stop_patience: 10
   early_stop_min_delta: 0.0
@@ -56,7 +56,7 @@ search_space:
   families: ["iT", "PatchTST", "Crossformer", "Hybrid"] # options for model families -- So far: ["iT", "PatchTST", "Crossformer", "Hybrid"] -- TDOD: Add more families like Autoformer, Informer, etc.
   stage_tokenizers: ["time", "var", "patch", "cross"] # options for stage tokenization -- So far: ["time", "var", "patch", "cross"]
   stage_retokens: ["none", "cross_attn"] # options for retokenization at stage boundaries -- So far: ["none", "cross_attn"]
-  stage_count_range: [1, 3]
+  stage_count_range: [1, 1]
   var_encoder_types: ["linear", "conv", "fft", "decomp_linear"]
   var_conv_kernels: [3, 5, 7] # convolution kernel sizes for variable-wise conv tokenization
   var_fft_keep_ratios: [0.125, 0.25, 0.5] # keep ratios for variable-wise FFT tokenization
@@ -89,7 +89,7 @@ search_space:
 
 evo:
   population_size: 20
-  max_evals: 3
+  max_evals: 300
   init_seed_fraction: 0.5
   mutation_rate: 0.3
   crossover_rate: 0.7

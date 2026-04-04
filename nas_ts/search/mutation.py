@@ -127,7 +127,7 @@ def mutate_genome(
     if len(g.stages) == 0:
         g.stages.append(_random_stage(ss, "stage0", is_stage0=True))
 
-    min_stages, max_stages = getattr(ss, "stage_count_range")
+    min_stages, max_stages = getattr(ss, "stage_count_range", (1, 3))
     min_stages = max(1, int(min_stages))
     max_stages = max(min_stages, int(max_stages))
 
