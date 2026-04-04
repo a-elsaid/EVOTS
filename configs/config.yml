@@ -1,0 +1,111 @@
+run:
+  name: ettm
+  logs_dir: logs
+  checkpoints_dir: checkpoints
+
+task:
+  task_type: forecasting
+  input_length: 384
+  pred_length: 192
+  d_in: 7
+  d_out: 7
+  metrics: [mse, mae, params]
+  use_norm: true
+
+data:
+  csv:
+    paths: ["./data/ETT/ETTh1.csv"]
+    feature_cols: ["HUFL","HULL","MUFL","MULL","LUFL","LULL","OT"]
+    target_cols: ["HUFL","HULL","MUFL","MULL","LUFL","LULL","OT"]
+    train_ratio: 0.7
+    val_ratio: 0.1
+    batch_size: 32
+    num_workers: 0
+    normalize: true
+    file_format: "auto"         
+    has_header: true           
+    delimiter: null   
+    npz_key: null     
+    use_col_indices: false
+    date_col: null 
+eval:
+  training_steps: 5
+  extra_training_steps: 20
+  early_stopping: true
+  early_stop_patience: 10
+  early_stop_min_delta: 0.0
+  early_stop_checks: 1
+  optimizer: adamw
+  optimizer_kwargs:
+    lr: 0.0001
+    weight_decay: 0.0003
+  device: auto
+  gpu_ids: null
+
+selection:
+  mode: single
+  objectives: ["mse"]
+
+
+search_space:
+  families: ["iT", "PatchTST", "Crossformer", "Hybrid"]
+  stage_tokenizers: ["time", "var", "patch", "cross"] 
+  stage_retokens: ["none", "cross_attn"]
+  var_encoder_types: ["linear", "conv", "fft", "decomp_linear"]
+  var_conv_kernels: [3, 5, 7] 
+  var_fft_keep_ratios: [0.125, 0.25, 0.5]
+  var_decomp_kernels: [3, 5, 7]
+  cross_groups: [1, 2, 4]
+  cross_patch_sizes: [4, 8, 16]
+  cross_strides: [1, 2, 4, 8]
+  cross_encoder_types: ["linear", "conv"]
+  cross_conv_kernels: [3, 5]
+  cross_pools: ["avg", "max"]
+  depth_range: [2, 24] 
+  model_dim_range: [256, 512]
+  num_heads_range: [4, 16]
+  ff_mult_range: [4.0, 4.0]
+  patch_sizes: [4, 8]
+  strides: [1, 2]
+  overlaps: [0.0]
+  per_channel_options: [true]
+  cross_groups: [1]
+  cross_fusions: ["add"]
+  freq_types: ["none", "fft"]
+  freq_keep_ratios: [0.5]
+  decomp_modes: ["none", "moving_avg"]
+  decomp_kernel_sizes: [3, 5]
+  conv_kernel_sizes: [3]
+  conv_dilations: [1]
+  block_types: ["attn", "inv_attn", "conv"]
+  pos_encoding_options: ["none", "absolute"] 
+  dropout_range: [0.0, 0.1]
+
+evo:
+  population_size: 20
+  max_evals: 3
+  init_seed_fraction: 0.5
+  mutation_rate: 0.3
+  crossover_rate: 0.7
+  steady_state: true
+  tournament_size: 2
+  use_weight_inheritance: true
+  evals_per_generation: 10
+  random_seed: 42
+  num_workers: 8
+  
+
+constraints:
+  min_blocks: 4
+  max_blocks: 8
+  max_conv_blocks: 4
+  max_freq_blocks: 4
+  max_cross_dim_blocks: 4
+
+seeds:
+  - type: iTransformer
+    model_dim: 256
+    num_layers: 4
+  - type: PatchTST
+    model_dim: 256
+    num_layers: 4

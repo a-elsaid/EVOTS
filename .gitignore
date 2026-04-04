@@ -1,0 +1,17 @@
+logs
+checkpoints
+paper
+data
+run_itransformer.sh
+nas_ts.egg-info
+configs/master_config.yml
+nas_ts/.DS_Store
+nas_ts/models/itransformer_paper.py
+.DS_Store
+nas_ts/legacy
+*/__pycache__
+*/*/__pycache__
+experiments/run_itransformer_paper.py
+experiments/exp_dummy_sine.py
+experiments/dummy_dataset.py
+experiments/exp_etth1_pareto.py
