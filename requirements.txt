@@ -1,0 +1,11 @@
+loguru==0.7.3
+tensorcircuit>=0.12.0
+matplotlib==3.10.8
+numpy==2.4.4
+pandas==3.0.2
+PyYAML==6.0
+PyYAML==6.0.3
+rich==15.0.0
+seaborn==0.13.2
+setuptools==82.0.1
+torch==2.0.1
