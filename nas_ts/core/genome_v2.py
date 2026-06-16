@@ -101,6 +101,22 @@ class CrossTokenHeadSpec:
     pool: str = "avg"                  # "avg" | "max"
 
 
+@dataclass
+class ConvBlockSpec:
+    enabled: bool = False
+    kernel_size: int = 3    # depthwise conv kernel (odd int)
+    dilation: int = 1       # dilation factor; receptive field = dilation*(kernel_size-1)+1
+
+
+@dataclass
+class QuantumBlockSpec:
+    enabled: bool = False
+    nlayers: int = 2                    # circuit depth (entangle+rotate layers)
+    entangle_pattern: str = "linear"    # "linear" | "circular"
+    gate_set: str = "rx_ry"            # "rx_ry" | "rx_ry_rz"
+    use_ffn: bool = True                # append FFN after the quantum residual
+
+
 # ----------------------------
 # NEW: StageSpec
 # ----------------------------
@@ -182,6 +198,8 @@ class Genome:
     # token heads
     var_head: VarTokenHeadSpec = field(default_factory=VarTokenHeadSpec)
     cross_head: CrossTokenHeadSpec = field(default_factory=CrossTokenHeadSpec)
+    conv_block: ConvBlockSpec = field(default_factory=ConvBlockSpec)
+    quantum_block: QuantumBlockSpec = field(default_factory=QuantumBlockSpec)
 
     # NEW: stage program (this enables future “stages” cleanly)
     stages: List[StageSpec] = field(default_factory=list)
@@ -203,10 +221,11 @@ class Genome:
             "dropout": self.dropout,
             "var_head": _to_plain(self.var_head),
             "cross_head": _to_plain(self.cross_head),
+            "conv_block": _to_plain(self.conv_block),
+            "quantum_block": _to_plain(self.quantum_block),
             "stages": [_to_plain(s) for s in self.stages],
         }
 
-    @classmethod
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Genome":
         return cls(
@@ -218,6 +237,8 @@ class Genome:
             dropout=float(d.get("dropout", 0.0)),
             var_head=VarTokenHeadSpec(**d.get("var_head", {"enabled": False})),
             cross_head=CrossTokenHeadSpec(**d.get("cross_head", {"enabled": False})),
+            conv_block=ConvBlockSpec(**d.get("conv_block", {"enabled": False})),
+            quantum_block=QuantumBlockSpec(**d.get("quantum_block", {"enabled": False})),
             stages=[_from_plain_stage(s) for s in d.get("stages", [])],
             # v1 fields (patching, cross_dim, freq_block, decomp_block, conv_block, blocks)
             # are intentionally ignored — they no longer exist on Genome
@@ -243,6 +264,8 @@ class Genome:
             "token_heads": {
                 "var_head": _to_plain(self.var_head),
                 "cross_head": _to_plain(self.cross_head),
+                "conv_block": _to_plain(self.conv_block),
+                "quantum_block": _to_plain(self.quantum_block),
             },
 
             "stages": [
@@ -298,6 +321,18 @@ class Genome:
             f"  - cross_head: enabled={self.cross_head.enabled}, groups={self.cross_head.groups}, "
             f"p={self.cross_head.patch_size}, s={self.cross_head.stride}, enc={self.cross_head.encoder_type}, "
             f"conv_k={self.cross_head.conv_kernel}, pool={self.cross_head.pool}"
+        )
+        lines.append(
+            f"  - conv_block: enabled={self.conv_block.enabled}, "
+            f"kernel={self.conv_block.kernel_size}, dilation={self.conv_block.dilation}, "
+            f"rf={self.conv_block.dilation * (self.conv_block.kernel_size - 1) + 1}"
+        )
+        lines.append(
+            f"  - quantum_block: enabled={self.quantum_block.enabled}, "
+            f"nlayers={self.quantum_block.nlayers}, "
+            f"entangle={self.quantum_block.entangle_pattern}, "
+            f"gate_set={self.quantum_block.gate_set}, "
+            f"use_ffn={self.quantum_block.use_ffn}"
         )
 
         # stages

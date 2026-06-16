@@ -31,6 +31,11 @@ def _init_process(exp_cfg: ExperimentConfig, gpu_id: Optional[int]):
     _G_EXP_CFG = exp_cfg
     _G_GPU_ID = gpu_id
 
+    # Suppress TensorFlow C++ / abseil mutex log noise before TF is ever imported.
+    # Must be set before the first `import tensorflow` in this process.
+    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+    os.environ.setdefault("ABSL_MIN_LOG_LEVEL", "3")
+
     setup_logging(exp_cfg.run_info.logs_dir + "/" + exp_cfg.run_info.name)
     torch.set_num_threads(1)
 

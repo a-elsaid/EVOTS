@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Optional
 import torch
 import json
@@ -189,12 +190,10 @@ class EvolutionEngine:
         num_completed = 0
 
         for indiv_id, metrics in completed:
-            # Completed job must exist in submitted
             indiv = self.submitted.pop(indiv_id, None)
-            
-            # if indiv is None:
-                # logger.warning(f"[Engine] Received completion for unknown indiv_id {indiv_id}. Ignoring.")
-                # ...
+            if indiv is None:
+                logger.warning(f"[Engine] Completion for unknown indiv_id={indiv_id}. Skipping.")
+                continue
                 
 
             # Attach eval_id + generation fields
@@ -316,7 +315,8 @@ class EvolutionEngine:
 
             # Run until we have COMPLETED max_evals (not just submitted)
             while self.eval_count < evo.max_evals:
-                self.step()
+                if self.step() == 0:
+                    time.sleep(0.05)
 
                 new_evals = self.eval_count - last_eval_count
                 if new_evals > 0:

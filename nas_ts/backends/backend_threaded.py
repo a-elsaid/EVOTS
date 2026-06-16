@@ -86,9 +86,14 @@ class ThreadedBackend(EvaluationBackend):
 
             return indiv_id, out
 
-        except Exception:
+        except Exception as e:
             logger.exception(f"Worker({worker_id}) error in indiv {indiv_id}")
-            raise
+            return indiv_id, {
+                "mse": float("inf"),
+                "mae": float("inf"),
+                "params": float("inf"),
+                "worker_error": str(e),
+            }
 
     def submit(self, indiv_id: str, genome: Any):
         if self._shutdown:
@@ -107,10 +112,21 @@ class ThreadedBackend(EvaluationBackend):
                     done_futures.append(fut)
 
         for fut in done_futures:
-            indiv_id, metrics = fut.result()
-            completed.append((indiv_id, metrics))
             with self._lock:
-                del self._future_to_id[fut]
+                indiv_id = self._future_to_id.pop(fut, None)
+            if indiv_id is None:
+                continue
+            try:
+                _, metrics = fut.result()
+                completed.append((indiv_id, metrics))
+            except Exception as e:
+                logger.exception(f"[ThreadedBackend] Future failed for indiv_id={indiv_id}")
+                completed.append((indiv_id, {
+                    "mse": float("inf"),
+                    "mae": float("inf"),
+                    "params": float("inf"),
+                    "worker_error": str(e),
+                }))
 
         return completed
 

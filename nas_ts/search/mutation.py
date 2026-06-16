@@ -57,6 +57,34 @@ def _maybe_randomize_var_head(g: Genome, ss: SearchSpaceConfig) -> None:
         g.var_head.decomp_kernel = int(random.choice(ks))
 
 
+def _maybe_randomize_quantum_block(g: Genome, ss: SearchSpaceConfig) -> None:
+    """Randomise quantum_block knobs whenever a block is switched to type 'quantum'."""
+    g.quantum_block.enabled = True
+
+    nlayers_range = getattr(ss, "quantum_nlayers_range", (1, 3))
+    g.quantum_block.nlayers = random.randint(int(nlayers_range[0]), int(nlayers_range[1]))
+
+    patterns = list(getattr(ss, "quantum_entangle_patterns", ["linear", "circular"]))
+    g.quantum_block.entangle_pattern = random.choice(patterns)
+
+    gate_sets = list(getattr(ss, "quantum_gate_sets", ["rx_ry", "rx_ry_rz"]))
+    g.quantum_block.gate_set = random.choice(gate_sets)
+
+    ffn_opts = list(getattr(ss, "quantum_use_ffn_options", [True, False]))
+    g.quantum_block.use_ffn = random.choice(ffn_opts)
+
+
+def _maybe_randomize_conv_block(g: Genome, ss: SearchSpaceConfig) -> None:
+    """Randomize conv_block knobs whenever a block is switched to type 'conv'."""
+    g.conv_block.enabled = True
+
+    kernels = list(getattr(ss, "conv_kernel_sizes", [3, 5, 7]))
+    g.conv_block.kernel_size = int(random.choice(kernels))
+
+    dilations = list(getattr(ss, "conv_dilations", [1]))
+    g.conv_block.dilation = int(random.choice(dilations))
+
+
 def _maybe_randomize_cross_head(g: Genome, ss: SearchSpaceConfig) -> None:
     """If a stage uses tokenizer='cross', ensure cross_head is enabled + has valid params."""
     g.cross_head.enabled = True
@@ -118,6 +146,14 @@ def mutate_genome(
     # if random.random() < mr:
     #     g.family = random.choice(ss.families)
 
+    # conv_block knob mutation (only when already active)
+    if g.conv_block.enabled and random.random() < mr:
+        _maybe_randomize_conv_block(g, ss)
+
+    # quantum_block knob mutation (only when already active)
+    if g.quantum_block.enabled and random.random() < mr:
+        _maybe_randomize_quantum_block(g, ss)
+
     # -------------------------
     # stage mutations
     # -------------------------
@@ -127,7 +163,7 @@ def mutate_genome(
     if len(g.stages) == 0:
         g.stages.append(_random_stage(ss, "stage0", is_stage0=True))
 
-    min_stages, max_stages = getattr(ss, "stage_count_range", (1, 3))
+    min_stages, max_stages = getattr(ss, "stage_count_range")
     min_stages = max(1, int(min_stages))
     max_stages = max(min_stages, int(max_stages))
 
@@ -172,6 +208,10 @@ def mutate_genome(
     if random.random() < mr and len(st.blocks) > 0:
         b = random.choice(st.blocks)
         b.block_type = random.choice(ss.block_types)
+        if b.block_type == "conv":
+            _maybe_randomize_conv_block(g, ss)
+        elif b.block_type == "quantum":
+            _maybe_randomize_quantum_block(g, ss)
 
     # -------------------------
     # constraints on total blocks across stages

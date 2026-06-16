@@ -18,7 +18,7 @@ def random_block(ss: SearchSpaceConfig) -> BlockSpec:
 
 def _random_stages(ss: SearchSpaceConfig, depth: int, family: str) -> List[StageSpec]:
     """Build a random single- or multi-stage pipeline respecting family constraints."""
-    min_stages, max_stages = getattr(ss, "stage_count_range", (1, 3))
+    min_stages, max_stages = getattr(ss, "stage_count_range")
     num_stages = random.randint(int(min_stages), int(max_stages))
 
     per_stage = [1] * num_stages

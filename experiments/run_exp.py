@@ -94,13 +94,14 @@ def main():
     exp_logger.save_config_copy(args.config)
     exp_logger.save_resolved_config(cfg)
 
-    final_pop, best_indiv = engine.run()
+    try:
+        final_pop, best_indiv = engine.run()
+    finally:
+        backend.shutdown(wait=True)
+        logger.info("[Run] Backend shutdown complete.")
 
     if best_indiv is None:
         raise RuntimeError("No best individual found (no completed evaluations?)")
-
-    backend.shutdown(wait=True)
-    logger.info("[Run] Backend shutdown complete.")
 
     individuals = sorted(
         [ind for ind in final_pop.get_all() if ind.metrics is not None],

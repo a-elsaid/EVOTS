@@ -126,6 +126,12 @@ class SearchSpaceConfig:
     var_fft_keep_ratios: List[float] = field(default_factory=lambda: [0.125, 0.25, 0.5])
     var_decomp_kernels: List[int] = field(default_factory=lambda: [3, 5, 7])
 
+    # ---- Quantum block knobs ----
+    quantum_nlayers_range: Tuple[int, int] = (1, 3)
+    quantum_entangle_patterns: List[str] = field(default_factory=lambda: ["linear", "circular"])
+    quantum_gate_sets: List[str] = field(default_factory=lambda: ["rx_ry", "rx_ry_rz"])
+    quantum_use_ffn_options: List[bool] = field(default_factory=lambda: [True, False])
+
     # ---- Stages (for genome_v2) ----
     stage_count_range: Tuple[int, int] = (1, 3)
     stage_tokenizers: List[str] = field(default_factory=lambda: ["time", "var", "patch", "cross"])

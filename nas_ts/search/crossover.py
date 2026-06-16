@@ -10,7 +10,7 @@ from .repair import repair_genome
 
 
 def _stage_bounds(ss: SearchSpaceConfig) -> Tuple[int, int]:
-    mn, mx = getattr(ss, "stage_count_range", (1, 3))
+    mn, mx = getattr(ss, "stage_count_range")
     mn = max(1, int(mn))
     mx = max(mn, int(mx))
     return mn, mx

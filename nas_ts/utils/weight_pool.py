@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from collections import OrderedDict
 from typing import Dict, Optional, List
 import copy
 import torch
@@ -44,13 +45,14 @@ def architecture_signature(genome: Genome) -> str:
 
 class WeightPool:
     """
-    Simple in-memory weight pool keyed by architecture signature.
+    In-memory weight pool keyed by architecture signature, with LRU eviction.
     It stores *state_dicts* of trained models.
     """
 
-    def __init__(self, enabled: bool = True):
+    def __init__(self, enabled: bool = True, max_size: int = 100):
         self.enabled = enabled
-        self._pool: Dict[str, Dict[str, torch.Tensor]] = {}
+        self.max_size = int(max_size)
+        self._pool: OrderedDict[str, Dict[str, torch.Tensor]] = OrderedDict()
 
     def to_config_dict(self) -> dict:
         # NOTE: NO  weights serialization -- only pool is enabled/disabled
@@ -59,9 +61,14 @@ class WeightPool:
     def get(self, genome: Genome) -> Optional[Dict[str, torch.Tensor]]:
         key = architecture_signature(genome)
         state = self._pool.get(key, None)
+        if state is not None:
+            self._pool.move_to_end(key)
         return copy.deepcopy(state) if state is not None else None
 
     def update(self, genome: Genome, state_dict: Dict[str, torch.Tensor]):
         key = architecture_signature(genome)
-        cpu_state = {k: v.detach().cpu() for k, v in state_dict.items()}
-        self._pool[key] = cpu_state
+        if key in self._pool:
+            self._pool.move_to_end(key)
+        elif len(self._pool) >= self.max_size:
+            self._pool.popitem(last=False)
+        self._pool[key] = {k: v.detach().cpu() for k, v in state_dict.items()}
