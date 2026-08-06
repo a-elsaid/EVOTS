@@ -426,12 +426,13 @@ class QuantumMixBlock(nn.Module):
     # ------------------------------------------------------------------
     def _build_circuit(self) -> None:
         """Compile the per-token quantum circuit (called once; JIT-cached by tc)."""
-        # NumPy 2.0 removed np.ComplexWarning (it is a Python builtin; numpy just
-        # stopped re-exporting it). Older tensorcircuit releases reference the alias
-        # at import time, so we restore it before the import if missing.
+        # NumPy 2.0 removed the top-level np.ComplexWarning alias; the class itself
+        # still exists at numpy.exceptions.ComplexWarning. Older tensorcircuit
+        # releases reference the top-level alias at import time, so we restore it
+        # before the import if missing.
         import numpy as _np
         if not hasattr(_np, "ComplexWarning"):
-            _np.ComplexWarning = ComplexWarning  # noqa: F821 – builtin
+            _np.ComplexWarning = _np.exceptions.ComplexWarning
 
         # TF startup emits abseil ABSL_RAW_LOG lines via write(2,...) — these
         # cannot be suppressed with env vars, so we swap fd 2 during init.
