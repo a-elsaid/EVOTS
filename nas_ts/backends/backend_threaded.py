@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, Future
 
@@ -11,6 +12,7 @@ from .backend_base import EvaluationBackend
 from ..core.config import ExperimentConfig
 from ..evaluate.evaluate import evaluate_genome
 from ..utils.weight_pool import WeightPool
+from ..utils.model_package import ModelPackage
 
 
 class ThreadedBackend(EvaluationBackend):
@@ -80,8 +82,16 @@ class ThreadedBackend(EvaluationBackend):
 
             if isinstance(out, tuple) and len(out) == 3:
                 metrics, state, meta = out
-                metrics["state_dict_cpu"] = state
-                metrics["meta"] = meta
+                pkg_dir = (
+                    Path(self.exp_cfg.run_info.logs_dir)
+                    / self.exp_cfg.run_info.name
+                    / "packages"
+                )
+                pkg_path = ModelPackage.from_state_dict(
+                    genome, state, meta=meta, metrics=metrics
+                ).save(pkg_dir / f"{indiv_id}.pt")
+                # Leading underscore keeps this out of the JSON metric logs.
+                metrics["_package_path"] = str(pkg_path)
                 return indiv_id, metrics
 
             return indiv_id, out

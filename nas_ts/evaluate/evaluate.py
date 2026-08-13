@@ -97,7 +97,24 @@ def _get_optimizer(model: nn.Module, eval_cfg: EvalConfig):
         return torch.optim.AdamW(model.parameters(), **kwargs)
     else:
         raise ValueError(f"Unsupported optimizer: {eval_cfg.optimizer}")
-    
+
+
+def _load_state_checked(model: nn.Module, state: dict, *, where: str) -> None:
+    """load_state_dict(strict=False) that refuses to drop keys silently.
+
+    Every load in this file used to swallow mismatches, which is how a tokenizer
+    projection could be discarded on load and re-initialised at random without a
+    single line of output.
+    """
+    incompatible = model.load_state_dict(state, strict=False)
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        logger.warning(
+            f"[Load:{where}] state_dict mismatch — "
+            f"missing={list(incompatible.missing_keys)} "
+            f"unexpected={list(incompatible.unexpected_keys)}"
+        )
+
+
 
 def _train_and_eval_on_dataset(
     genome: Genome,
@@ -128,7 +145,7 @@ def _train_and_eval_on_dataset(
 
     if init_state_dict_cpu is not None:
         try:
-            model.load_state_dict(init_state_dict_cpu, strict=False)
+            _load_state_checked(model, init_state_dict_cpu, where="WeightInherit")
             logger.info("[WeightInherit] Loaded init state_dict into model")
         except Exception as e:
             logger.warning(f"[WeightInherit] Failed to load init weights: {e}")
@@ -220,7 +237,7 @@ def _train_and_eval_on_dataset(
 
     # restore best weights if we have them
     if best_state is not None:
-        model.load_state_dict(best_state, strict=False)
+        _load_state_checked(model, best_state, where="EarlyStopRestore")
 
     # -------------------------
     # Final Validation Metrics (+ latency)
@@ -348,7 +365,9 @@ def finetune_and_test(
     model = build_model_from_meta(genome, task, meta)
     model.to(device)
     if initial_state_dict_cpu is not None:
-        model.load_state_dict(initial_state_dict_cpu, strict=False)
+        # Rebuilt from the genome, so any mismatch is a real architecture/weights
+        # disagreement and must not be papered over.
+        model.load_state_dict(initial_state_dict_cpu, strict=True)
 
     optimizer = _get_optimizer(model, eval_cfg)
     mse_crit = nn.MSELoss()
@@ -435,7 +454,7 @@ def finetune_and_test(
 
     # ---- restore best weights ----
     if best_state_cpu is not None:
-        model.load_state_dict(best_state_cpu, strict=False)
+        _load_state_checked(model, best_state_cpu, where="FinetuneRestore")
         logger.info(
             f"[Finetune] Restored best model "
             f"(val_mse={best_val_mse:.6f})"

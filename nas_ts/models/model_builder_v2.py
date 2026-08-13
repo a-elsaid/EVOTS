@@ -108,7 +108,11 @@ class PatchTokenHead(nn.Module):
         self.p = int(patching.patch_size)
         self.s = int(patching.stride) if int(patching.stride) > 0 else int(patching.patch_size)
         self.D = int(D)
-        self.proj: Optional[nn.Linear] = None
+        self.d_in = int(d_in)
+        # Padding below is along L only, so the flattened patch is always
+        # patch_size * d_in wide. Built here (not lazily in forward) so the layer
+        # is present in state_dict at load time and visible to the optimizer.
+        self.proj = nn.Linear(self.p * self.d_in, self.D)
         self.drop = nn.Dropout(float(dropout))
 
     def forward(self, x: torch.Tensor, x_mark: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -127,8 +131,11 @@ class PatchTokenHead(nn.Module):
         B2, N, p2, Din2 = patches.shape
         flat = patches.reshape(B2, N, p2 * Din2)
 
-        if self.proj is None or self.proj.in_features != flat.size(-1):
-            self.proj = nn.Linear(flat.size(-1), self.D).to(x.device)
+        if flat.size(-1) != self.proj.in_features:
+            raise ValueError(
+                f"PatchTokenHead expected in_features={self.proj.in_features} "
+                f"(patch_size={self.p} * d_in={self.d_in}), got {flat.size(-1)}"
+            )
 
         return self.drop(self.proj(flat))
 
@@ -173,7 +180,12 @@ class CrossTokenHead(nn.Module):
         self.encoder_type = getattr(cross_head_spec, "encoder_type", "linear")
         self.pool = getattr(cross_head_spec, "pool", "avg")
 
-        self.proj_linear: Optional[nn.Linear] = None
+        # Each group is ceil(d_in / groups) wide after padding, and pooling in
+        # forward() collapses the patch axis, so the projection input is always
+        # group_width. Built here (not lazily in forward) so the layer is present
+        # in state_dict at load time and visible to the optimizer.
+        self.group_width = int(math.ceil(int(d_in) / self.groups))
+        self.proj_linear = nn.Linear(self.group_width, self.D)
         k = int(getattr(cross_head_spec, "conv_kernel", 3))
         self.conv = nn.Conv1d(1, 8, kernel_size=k, padding=k // 2)
         self.conv_proj = nn.Linear(8, self.D)
@@ -213,8 +225,11 @@ class CrossTokenHead(nn.Module):
             tok = self.conv_proj(z)
         else:
             pooled = tokens_raw.mean(dim=1)
-            if self.proj_linear is None or self.proj_linear.in_features != pooled.size(-1):
-                self.proj_linear = nn.Linear(pooled.size(-1), self.D).to(x.device)
+            if pooled.size(-1) != self.group_width:
+                raise ValueError(
+                    f"CrossTokenHead expected group_width={self.group_width} "
+                    f"(ceil(d_in / groups={self.groups})), got {pooled.size(-1)}"
+                )
             tok = self.proj_linear(pooled)
 
         tok = self.drop(self.ln(tok))
@@ -477,6 +492,20 @@ class QuantumMixBlock(nn.Module):
             return K.vmap(run_single)(x_batch)
 
         self._qpred_torch = tc.interfaces.torch_interface(qpred_batch, jit=True)
+
+    # ------------------------------------------------------------------
+    def __getstate__(self):
+        # tc.interfaces.torch_interface returns a closure (torch_interface.<locals>.Fun)
+        # which pickle cannot reference by name, so a model that has run a forward
+        # pass is otherwise unpicklable. It is rebuilt from hyperparameters on the
+        # next forward and never appears in state_dict(), so dropping it is lossless.
+        state = dict(self.__dict__)
+        state["_qpred_torch"] = None
+        return state
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        self._qpred_torch = None
 
     # ------------------------------------------------------------------
     def forward(self, x: torch.Tensor) -> torch.Tensor:
