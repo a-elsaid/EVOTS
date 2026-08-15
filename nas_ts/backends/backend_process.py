@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import multiprocessing as mp
+from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
 from concurrent.futures import ProcessPoolExecutor, Future
 
@@ -14,6 +15,7 @@ from ..core.config import ExperimentConfig
 from ..evaluate.evaluate import evaluate_genome
 from ..utils.devices import validate_gpu_ids
 from ..utils.logger import setup_logging
+from ..utils.model_package import ModelPackage
 
 
 _G_EXP_CFG: Optional[ExperimentConfig] = None
@@ -61,19 +63,37 @@ def _process_worker(indiv_id: str, genome: Any) -> Tuple[str, Dict[str, float]]:
         out = evaluate_genome(
             genome,
             _G_EXP_CFG,
-            return_state=False,
+            return_state=True,
         )
 
-        if isinstance(out, dict):
-            clean = {}
-            for k, v in out.items():
-                if torch.is_tensor(v):
-                    clean[k] = float(v.detach().cpu().item()) if v.numel() == 1 else float("nan")
-                else:
-                    clean[k] = v
-            out = clean
+        if isinstance(out, tuple) and len(out) == 3:
+            metrics, state, meta = out
+        else:
+            metrics, state, meta = out, None, None
 
-        return indiv_id, out
+        clean = {}
+        for k, v in (metrics or {}).items():
+            if torch.is_tensor(v):
+                clean[k] = float(v.detach().cpu().item()) if v.numel() == 1 else float("nan")
+            else:
+                clean[k] = v
+
+        # Weights go to disk and only the path crosses the process boundary: a
+        # large model would otherwise push hundreds of MB through the pool's
+        # result channel, once per worker.
+        if state is not None:
+            pkg_dir = (
+                Path(_G_EXP_CFG.run_info.logs_dir)
+                / _G_EXP_CFG.run_info.name
+                / "packages"
+            )
+            pkg_path = ModelPackage.from_state_dict(
+                genome, state, meta=meta, metrics=clean
+            ).save(pkg_dir / f"{indiv_id}.pt")
+            # Leading underscore keeps this out of the JSON metric logs.
+            clean["_package_path"] = str(pkg_path)
+
+        return indiv_id, clean
 
     except Exception as e:
         logger.exception(f"[Worker] crash indiv_id={indiv_id}")
