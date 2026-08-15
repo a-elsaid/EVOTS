@@ -1,5 +1,6 @@
 logs
 checkpoints
+.venv/
 paper
 data
 run_itransformer.sh

@@ -4,6 +4,7 @@ import time
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from loguru import logger
 
@@ -87,6 +88,11 @@ def mae_loss(y_hat: torch.Tensor, y: torch.Tensor) -> float:
     return torch.mean(torch.abs(y_hat - y)).item()
 
 
+def classification_accuracy(logits: torch.Tensor, y: torch.Tensor) -> float:
+    preds = logits.argmax(dim=-1)
+    return (preds == y).float().mean().item()
+
+
 def _get_optimizer(model: nn.Module, eval_cfg: EvalConfig):
     opt_name = eval_cfg.optimizer.lower()
     kwargs = eval_cfg.optimizer_kwargs.copy()
@@ -128,6 +134,7 @@ def _train_and_eval_on_dataset(
     eval_cfg = exp_cfg.eval_config
     task = eval_cfg.task
     device = auto_detect_device(eval_cfg.device)
+    is_classification = (task.task_type == "classification")
 
     ds_cfg = eval_cfg.datasets[ds_index]
 
@@ -168,9 +175,14 @@ def _train_and_eval_on_dataset(
     # Helpers
     # -------------------------
     def _val_mse_only() -> float:
-        """Compute mean val MSE (aligned) for early stopping."""
+        """Compute mean val loss (aligned) for early stopping.
+
+        For forecasting this is MSE; for classification this is cross-entropy.
+        Both are "lower is better", so every early-stopping comparison below
+        (`cur_val < best_val`) is correct unchanged in either case.
+        """
         model.eval()
-        mse_vals = []
+        val_losses = []
         with torch.no_grad():
             for batch in val_loader:
                 x, y, x_mark, y_mark = _unpack_batch(batch)
@@ -179,12 +191,15 @@ def _train_and_eval_on_dataset(
                 x_mark = x_mark.to(device)
                 y_mark = y_mark.to(device)
                 y_hat = model(x, x_mark=x_mark, y_mark=y_mark)  # even if y_mark unused
-                y_hat_aligned, y_aligned = _align_pred_target(y_hat, y)
-                mse_vals.append(torch.mean((y_hat_aligned - y_aligned) ** 2).item())
+                if is_classification:
+                    val_losses.append(F.cross_entropy(y_hat, y).item())
+                else:
+                    y_hat_aligned, y_aligned = _align_pred_target(y_hat, y)
+                    val_losses.append(torch.mean((y_hat_aligned - y_aligned) ** 2).item())
         model.train()
-        if not mse_vals:
+        if not val_losses:
             return float("inf")
-        return float(sum(mse_vals) / len(mse_vals))
+        return float(sum(val_losses) / len(val_losses))
 
     # -------------------------
     # Training + Early Stopping
@@ -208,8 +223,11 @@ def _train_and_eval_on_dataset(
 
             optimizer.zero_grad()
             y_hat = model(x, x_mark=x_mark, y_mark=y_mark)  # even if y_mark unused
-            y_hat, y = _align_pred_target(y_hat, y)
-            loss = torch.mean((y_hat - y) ** 2)
+            if is_classification:
+                loss = F.cross_entropy(y_hat, y)
+            else:
+                y_hat, y = _align_pred_target(y_hat, y)
+                loss = torch.mean((y_hat - y) ** 2)
             loss.backward()
             optimizer.step()
 
@@ -245,6 +263,8 @@ def _train_and_eval_on_dataset(
     model.eval()
     mse_vals = []
     mae_vals = []
+    loss_vals = []
+    acc_vals = []
 
     latency = None
     measured_latency = False
@@ -270,24 +290,40 @@ def _train_and_eval_on_dataset(
                 measured_latency = True
 
             y_hat = model(x, x_mark=x_mark, y_mark=y_mark)
-            mse_vals.append(mse_loss(y_hat, y))
-            mae_vals.append(mae_loss(y_hat, y))
+            if is_classification:
+                loss_vals.append(F.cross_entropy(y_hat, y).item())
+                acc_vals.append(classification_accuracy(y_hat, y))
+            else:
+                mse_vals.append(mse_loss(y_hat, y))
+                mae_vals.append(mae_loss(y_hat, y))
 
-    mse_mean = float(sum(mse_vals) / len(mse_vals)) if mse_vals else float("inf")
-    mae_mean = float(sum(mae_vals) / len(mae_vals)) if mae_vals else float("inf")
     params = count_parameters(model)
 
-    metrics = {
-        "mse": mse_mean,
-        "mae": mae_mean,
-        "params": float(params),
-    }
+    if is_classification:
+        loss_mean = float(sum(loss_vals) / len(loss_vals)) if loss_vals else float("inf")
+        acc_mean = float(sum(acc_vals) / len(acc_vals)) if acc_vals else 0.0
+        metrics = {
+            "loss": loss_mean,
+            "accuracy": acc_mean,
+            "params": float(params),
+        }
+    else:
+        mse_mean = float(sum(mse_vals) / len(mse_vals)) if mse_vals else float("inf")
+        mae_mean = float(sum(mae_vals) / len(mae_vals)) if mae_vals else float("inf")
+        metrics = {
+            "mse": mse_mean,
+            "mae": mae_mean,
+            "params": float(params),
+        }
     if latency is not None:
         metrics["latency"] = float(latency)
 
     # (optional) also expose best_val seen during training
     if best_val != float("inf"):
-        metrics["best_val_mse"] = float(best_val)
+        if is_classification:
+            metrics["best_val_loss"] = float(best_val)
+        else:
+            metrics["best_val_mse"] = float(best_val)
 
     # --- update weight pool with BEST weights ---
     # if weight_pool is not None:
@@ -345,6 +381,7 @@ def finetune_and_test(
     eval_cfg = exp_cfg.eval_config
     task = eval_cfg.task
     device = auto_detect_device(eval_cfg.device)
+    is_classification = (task.task_type == "classification")
 
 
     can_early_stop = eval_cfg.early_stopping
@@ -370,8 +407,11 @@ def finetune_and_test(
         model.load_state_dict(initial_state_dict_cpu, strict=True)
 
     optimizer = _get_optimizer(model, eval_cfg)
-    mse_crit = nn.MSELoss()
-    mae_crit = nn.L1Loss()
+    if is_classification:
+        criterion = nn.CrossEntropyLoss()
+    else:
+        mse_crit = nn.MSELoss()
+        mae_crit = nn.L1Loss()
 
     # best_val_mse = float("inf")
     best_val_mse = best_fitness if best_fitness is not None else float("inf")
@@ -395,9 +435,11 @@ def finetune_and_test(
         optimizer.zero_grad()
 
         y_hat = model(x, x_mark=x_mark, y_mark=y_mark   )  # even if y_mark unused
-        y_hat, y = _align_pred_target(y_hat, y)
-
-        loss = mse_crit(y_hat, y)
+        if is_classification:
+            loss = criterion(y_hat, y)
+        else:
+            y_hat, y = _align_pred_target(y_hat, y)
+            loss = mse_crit(y_hat, y)
         loss.backward()
         optimizer.step()
 
@@ -406,15 +448,18 @@ def finetune_and_test(
             continue
 
         model.eval()
-        val_mse_vals = []
+        val_mse_vals = []  # holds val loss: CE for classification, MSE for forecasting
 
         with torch.no_grad():
             for batch in val_loader:
                 vx, vy, vx_mark, vy_mark = _unpack_batch(batch)
                 vx, vy, vx_mark, vy_mark = vx.to(device), vy.to(device), vx_mark.to(device), vy_mark.to(device)
                 vy_hat = model(vx, x_mark=vx_mark, y_mark=vy_mark)
-                vy_hat, vy = _align_pred_target(vy_hat, vy)
-                val_mse_vals.append(mse_crit(vy_hat, vy).item())
+                if is_classification:
+                    val_mse_vals.append(criterion(vy_hat, vy).item())
+                else:
+                    vy_hat, vy = _align_pred_target(vy_hat, vy)
+                    val_mse_vals.append(mse_crit(vy_hat, vy).item())
 
         model.train()
 
@@ -466,29 +511,46 @@ def finetune_and_test(
     # ---- test evaluation ----
     model.eval()
     mse_vals, mae_vals = [], []
+    loss_vals, acc_vals = [], []
 
     with torch.no_grad():
         for batch in test_loader:
             x, y, x_mark, y_mark = _unpack_batch(batch)
             x, y, x_mark, y_mark = x.to(device), y.to(device), x_mark.to(device), y_mark.to(device)
             y_hat = model(x, x_mark=x_mark, y_mark=y_mark)
-            y_hat, y = _align_pred_target(y_hat, y)
-            mse_vals.append(mse_crit(y_hat, y).item())
-            mae_vals.append(mae_crit(y_hat, y).item())
+            if is_classification:
+                loss_vals.append(criterion(y_hat, y).item())
+                acc_vals.append(classification_accuracy(y_hat, y))
+            else:
+                y_hat, y = _align_pred_target(y_hat, y)
+                mse_vals.append(mse_crit(y_hat, y).item())
+                mae_vals.append(mae_crit(y_hat, y).item())
 
-    test_mse = float(sum(mse_vals) / len(mse_vals)) if mse_vals else float("inf")
-    test_mae = float(sum(mae_vals) / len(mae_vals)) if mae_vals else float("inf")
-
-    logger.info(
-        f"[Finetune] TEST results | "
-        f"mse={test_mse:.6f} | mae={test_mae:.6f}"
-    )
-
-    test_metrics = {
-        "test_mse": test_mse,
-        "test_mae": test_mae,
-        "best_val_mse": best_val_mse,
-        "finetune_steps_run": step,
-    }
+    if is_classification:
+        test_loss = float(sum(loss_vals) / len(loss_vals)) if loss_vals else float("inf")
+        test_acc = float(sum(acc_vals) / len(acc_vals)) if acc_vals else 0.0
+        logger.info(
+            f"[Finetune] TEST results | "
+            f"loss={test_loss:.6f} | accuracy={test_acc:.4f}"
+        )
+        test_metrics = {
+            "test_loss": test_loss,
+            "test_accuracy": test_acc,
+            "best_val_loss": best_val_mse,
+            "finetune_steps_run": step,
+        }
+    else:
+        test_mse = float(sum(mse_vals) / len(mse_vals)) if mse_vals else float("inf")
+        test_mae = float(sum(mae_vals) / len(mae_vals)) if mae_vals else float("inf")
+        logger.info(
+            f"[Finetune] TEST results | "
+            f"mse={test_mse:.6f} | mae={test_mae:.6f}"
+        )
+        test_metrics = {
+            "test_mse": test_mse,
+            "test_mae": test_mae,
+            "best_val_mse": best_val_mse,
+            "finetune_steps_run": step,
+        }
 
     return test_metrics, best_state_cpu, meta

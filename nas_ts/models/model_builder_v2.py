@@ -664,6 +664,20 @@ class TokenPoolForecastHead(nn.Module):
         return self.proj(p).view(z.size(0), self.pred_len, self.d_out)
 
 
+class ClassificationHead(nn.Module):
+    """Pools over token axis then projects to [B, num_classes] logits."""
+
+    def __init__(self, d_model: int, num_classes: int, pool: str = "mean"):
+        super().__init__()
+        self.pool = pool
+        self.num_classes = int(num_classes)
+        self.proj = nn.Linear(int(d_model), self.num_classes)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        p = z.max(dim=1).values if self.pool == "max" else z.mean(dim=1)
+        return self.proj(p)
+
+
 def make_tokenizer(task: TaskConfig, genome: Genome, stage: StageSpec) -> nn.Module:
     tok = stage.tokenizer
 
@@ -699,10 +713,11 @@ class StagedForecastModel(nn.Module):
       (optional per-window norm) -> stages(tokenize -> optional retokenize -> core) -> head -> (optional denorm)
     """
 
-    def __init__(self, genome: Genome, task: TaskConfig):
+    def __init__(self, genome: Genome, task: TaskConfig, num_classes: Optional[int] = None):
         super().__init__()
         self.genome = genome
         self.task = task
+        self.is_classification = (task.task_type == "classification")
 
         self.use_norm = bool(getattr(task, "use_norm", False))
         self.normer = WindowNorm() if self.use_norm else None
@@ -717,7 +732,11 @@ class StagedForecastModel(nn.Module):
                 if st.retokenize == "cross_attn" else nn.Identity()
             self.stage_modules.append(nn.ModuleDict({"tok": tok, "retok": retok, "core": core}))
 
-        if genome.stages[0].tokenizer == "var":
+        if self.is_classification:
+            if num_classes is None:
+                raise ValueError("num_classes is required when task.task_type == 'classification'")
+            self.head = ClassificationHead(genome.model_dim, num_classes)
+        elif genome.stages[0].tokenizer == "var":
             self.head = ITransformerProjectorHead(genome.model_dim, task.pred_length)
         else:
             self.head = TokenPoolForecastHead(genome.model_dim, task.pred_length, task.d_out, pool="mean")
@@ -739,6 +758,9 @@ class StagedForecastModel(nn.Module):
             prev_tokens = tokens
 
         assert tokens is not None
+
+        if self.is_classification:
+            return self.head(tokens)
 
         if isinstance(self.head, ITransformerProjectorHead):
             y = self.head(tokens, n_vars=int(self.task.d_in))
@@ -769,17 +791,26 @@ def resolve_task(task: TaskConfig, *, d_in: Optional[int] = None, d_out: Optiona
         d_in=task.d_in if d_in is None else int(d_in),
         d_out=task.d_out if d_out is None else int(d_out),
         metrics=task.metrics,
+        use_norm=task.use_norm,
     )
 
 
-def build_model(genome: Genome, task: TaskConfig, *, d_in: Optional[int] = None, d_out: Optional[int] = None) -> nn.Module:
+def build_model(
+    genome: Genome, task: TaskConfig, *,
+    d_in: Optional[int] = None, d_out: Optional[int] = None,
+    num_classes: Optional[int] = None,
+) -> nn.Module:
     t = resolve_task(task, d_in=d_in, d_out=d_out)
-    if t.task_type != "forecasting":
-        raise NotImplementedError("Only forecasting supported.")
-    return StagedForecastModel(genome, t)
+    if t.task_type == "forecasting":
+        return StagedForecastModel(genome, t)
+    if t.task_type == "classification":
+        return StagedForecastModel(genome, t, num_classes=num_classes)
+    raise NotImplementedError(f"Unsupported task_type={t.task_type!r}. "
+                               f"Supported: 'forecasting', 'classification'.")
 
 
 def build_model_from_meta(genome: Genome, task: TaskConfig, meta: Mapping[str, Any]) -> nn.Module:
     d_in = int(meta.get("d_in", task.d_in))
     d_out = int(meta.get("d_out", task.d_out))
-    return build_model(genome, task, d_in=d_in, d_out=d_out)
+    num_classes = meta.get("num_classes") if task.task_type == "classification" else None
+    return build_model(genome, task, d_in=d_in, d_out=d_out, num_classes=num_classes)

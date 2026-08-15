@@ -7,6 +7,7 @@ from .config import (
     EvolutionConfig, GenomeConstraints, ExperimentConfig
 )
 from ..utils.csv_data_module import make_csv_dataloaders, CSVDataConfig
+from ..utils.tabular_data_module import make_tabular_dataloaders, TabularDataConfig
 from ..search.seeds import make_iTransformer_like, make_PatchTST_like
 
 
@@ -68,46 +69,88 @@ def aggregate_mse(metrics: dict) -> float:
     return metrics["mse"]
 
 
+def aggregate_classification_fitness(metrics: dict) -> float:
+    # Every comparison in engine.py/selection_ops.py assumes "lower fitness is
+    # better" (tournament selection, early stopping, Pareto dominance). Using
+    # loss (not raw accuracy) as fitness keeps that assumption true without
+    # touching any of those comparison sites.
+    return metrics["loss"]
+
+
 def build_experiment(cfg: dict) -> ExperimentConfig:
     task = TaskConfig(**cfg["task"])
 
-    csv_dm_cfg = CSVDataConfig(
-        paths=cfg["data"]["csv"]["paths"],
-        input_length=task.input_length,
-        pred_length=task.pred_length,
-        feature_cols=cfg["data"]["csv"].get("feature_cols"),
-        target_cols=cfg["data"]["csv"].get("target_cols"),
-        train_ratio=cfg["data"]["csv"]["train_ratio"],
-        val_ratio=cfg["data"]["csv"]["val_ratio"],
-        batch_size=cfg["data"]["csv"]["batch_size"],
-        num_workers=cfg["data"]["csv"]["num_workers"],
-        normalize=cfg["data"]["csv"]["normalize"],
-        file_format=cfg["data"]["csv"].get("file_format", "auto"),
-        has_header=cfg["data"]["csv"].get("has_header", True),
-        delimiter=cfg["data"]["csv"].get("delimiter", None),
-        npz_key=cfg["data"]["csv"].get("npz_key", None),
-        use_col_indices=cfg["data"]["csv"].get("use_col_indices", False),
-        date_col=cfg["data"]["csv"].get("date_col", "date"),
-    )
+    if task.task_type == "classification":
+        # WindowNorm degenerates to all-zero output at input_length=1 (mean of a
+        # single point is itself, so x - mean = 0 everywhere). Classification
+        # tabular data uses input_length=1, so this must stay off.
+        if task.use_norm:
+            raise ValueError(
+                "task.use_norm must be false for task_type='classification' "
+                "(WindowNorm divides by ~0 at input_length=1 and silently "
+                "zeroes every feature)."
+            )
 
-    csv_ds_cfg = DatasetConfig(
-        name="CSV",
-        loader_fn=make_csv_dataloaders,
-        loader_kwargs={"cfg": csv_dm_cfg},
-        train_split=None,
-        val_split=None,
-    )
+        tab_cfg = cfg["data"]["tabular"]
+        tab_dm_cfg = TabularDataConfig(
+            path=tab_cfg["path"],
+            feature_cols=tab_cfg.get("feature_cols"),
+            target_col=tab_cfg.get("target_col", "target"),
+            train_ratio=tab_cfg["train_ratio"],
+            val_ratio=tab_cfg["val_ratio"],
+            batch_size=tab_cfg["batch_size"],
+            num_workers=tab_cfg.get("num_workers", 0),
+            normalize=tab_cfg.get("normalize", True),
+            random_seed=tab_cfg.get("random_seed", 42),
+        )
+        ds_cfg = DatasetConfig(
+            name="Tabular",
+            loader_fn=make_tabular_dataloaders,
+            loader_kwargs={"cfg": tab_dm_cfg},
+            train_split=None,
+            val_split=None,
+        )
+        batch_size = tab_dm_cfg.batch_size
+        aggregation_fn = aggregate_classification_fitness
+    else:
+        csv_dm_cfg = CSVDataConfig(
+            paths=cfg["data"]["csv"]["paths"],
+            input_length=task.input_length,
+            pred_length=task.pred_length,
+            feature_cols=cfg["data"]["csv"].get("feature_cols"),
+            target_cols=cfg["data"]["csv"].get("target_cols"),
+            train_ratio=cfg["data"]["csv"]["train_ratio"],
+            val_ratio=cfg["data"]["csv"]["val_ratio"],
+            batch_size=cfg["data"]["csv"]["batch_size"],
+            num_workers=cfg["data"]["csv"]["num_workers"],
+            normalize=cfg["data"]["csv"]["normalize"],
+            file_format=cfg["data"]["csv"].get("file_format", "auto"),
+            has_header=cfg["data"]["csv"].get("has_header", True),
+            delimiter=cfg["data"]["csv"].get("delimiter", None),
+            npz_key=cfg["data"]["csv"].get("npz_key", None),
+            use_col_indices=cfg["data"]["csv"].get("use_col_indices", False),
+            date_col=cfg["data"]["csv"].get("date_col", "date"),
+        )
+        ds_cfg = DatasetConfig(
+            name="CSV",
+            loader_fn=make_csv_dataloaders,
+            loader_kwargs={"cfg": csv_dm_cfg},
+            train_split=None,
+            val_split=None,
+        )
+        batch_size = csv_dm_cfg.batch_size
+        aggregation_fn = aggregate_mse
 
     eval_cfg = EvalConfig(
         task=task,
-        datasets=[csv_ds_cfg],
+        datasets=[ds_cfg],
         training_steps=cfg["eval"]["training_steps"],
         extra_training_steps=cfg["eval"]["extra_training_steps"],
         early_stopping=cfg["eval"]["early_stopping"],
         early_stop_patience=cfg["eval"]["early_stop_patience"],
         early_stop_min_delta=cfg["eval"]["early_stop_min_delta"],
         early_stop_checks=cfg["eval"]["early_stop_checks"],
-        batch_size=csv_dm_cfg.batch_size,
+        batch_size=batch_size,
         optimizer=cfg["eval"]["optimizer"],
         optimizer_kwargs=cfg["eval"].get("optimizer_kwargs", {}),
         device=cfg["eval"]["device"],
@@ -116,7 +159,7 @@ def build_experiment(cfg: dict) -> ExperimentConfig:
     sel_cfg = SelectionConfig(
         mode=cfg["selection"]["mode"],
         objectives=cfg["selection"]["objectives"],
-        aggregation=aggregate_mse,
+        aggregation=aggregation_fn,
     )
 
     # Filter unknown keys to avoid crashes on config fields not in the dataclass
