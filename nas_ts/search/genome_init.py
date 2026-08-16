@@ -45,11 +45,7 @@ def _random_stages(ss: SearchSpaceConfig, depth: int, family: str) -> List[Stage
         if prev_tok is not None and tokenizer == prev_tok and len(tok_choices) > 1:
             tokenizer = random.choice([t for t in tok_choices if t != prev_tok])
 
-        if i == 0:
-            retokenize = "none"
-        else:
-            retok_choices = getattr(ss, "stage_retokens", ["none", "cross_attn"])
-            retokenize = random.choice(retok_choices)
+        retokenize = "none" if i == 0 else "cross_attn"
 
         stages.append(StageSpec(
             name=f"stage{i}",
