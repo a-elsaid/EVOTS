@@ -131,7 +131,7 @@ class StageSpec:
     """
     name: str = "stage0"
 
-    # "time" | "var" | "patch" | "cross"
+    # "time" | "var" | "patch" | "cross" | "none"
     tokenizer: str = "time"
 
     # cross-attention re-tokenization between tokenizer and core blocks

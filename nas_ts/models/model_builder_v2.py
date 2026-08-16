@@ -236,6 +236,34 @@ class CrossTokenHead(nn.Module):
         return tok.view(B, G * Nseg, self.D)
 
 
+class NoneTokenHead(nn.Module):
+    """
+    One token per feature, per-feature learned affine: [B, 1, d_in] -> [B, d_in, D].
+
+    Unlike VarTokenHead_iTransformer (one shared Linear(1 -> D) across all features,
+    so equal-valued features collide into identical tokens), each feature j gets its
+    own W_j, b_j in R^D. No cross-feature mixing, no CLS token, no positional
+    encoding, no normalization inside the tokenizer.
+    """
+
+    def __init__(self, n_features: int, d_model: int):
+        super().__init__()
+        self.n_features = int(n_features)
+        self.d_model = int(d_model)
+        self.weight = nn.Parameter(torch.randn(self.n_features, self.d_model) * 0.02)
+        self.bias = nn.Parameter(torch.zeros(self.n_features, self.d_model))
+
+    def forward(self, x: torch.Tensor, x_mark: Optional[torch.Tensor] = None) -> torch.Tensor:
+        B, L, Din = x.shape
+        if L != 1:
+            raise ValueError(f"NoneTokenHead expected L=1, got {L}")
+        if Din != self.n_features:
+            raise ValueError(f"NoneTokenHead expected d_in={self.n_features}, got {Din}")
+
+        xj = x.squeeze(1)                      # [B, d_in]
+        return xj.unsqueeze(-1) * self.weight + self.bias  # [B, d_in, D]
+
+
 class FullAttentionRepo(nn.Module):
     """Repo-like full attention over tokens (no causal mask)."""
 
@@ -703,6 +731,9 @@ def make_tokenizer(task: TaskConfig, genome: Genome, stage: StageSpec) -> nn.Mod
         ch = genome.cross_head
         ch.enabled = True
         return CrossTokenHead(task.d_in, genome.model_dim, ch, dropout=genome.dropout)
+
+    if tok == "none":
+        return NoneTokenHead(n_features=task.d_in, d_model=genome.model_dim)
 
     raise ValueError(f"Unknown stage.tokenizer={tok!r}")
 

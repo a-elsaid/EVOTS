@@ -27,7 +27,7 @@ def _random_stages(ss: SearchSpaceConfig, depth: int, family: str) -> List[Stage
         per_stage[random.randrange(num_stages)] += 1
 
     if family == "iT":
-        tok_choices = ["var"]
+        tok_choices = ["var", "none"]
     elif family == "PatchTST":
         tok_choices = ["patch"]
     elif family == "Crossformer":

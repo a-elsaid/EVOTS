@@ -25,7 +25,7 @@ def _random_block(ss: SearchSpaceConfig) -> BlockSpec:
 
 def _allowed_tokenizers_for_family(family: str) -> set[str]:
     if family == "iT":
-        return {"var"}
+        return {"var", "none"}
     if family == "PatchTST":
         return {"patch"}
     if family == "Crossformer":

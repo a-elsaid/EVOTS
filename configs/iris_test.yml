@@ -39,7 +39,7 @@ selection:
 
 search_space:
   families: ["iT"]
-  stage_tokenizers: ["var"]
+  stage_tokenizers: ["var", "none"]
   stage_retokens: ["none"]
   var_encoder_types: ["linear"]
   var_conv_kernels: [3]
