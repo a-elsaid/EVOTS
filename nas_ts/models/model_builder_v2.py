@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import math
 import os
+from collections import OrderedDict
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import torch
@@ -376,18 +377,190 @@ class ConvTokenMixBlock(nn.Module):
         return x + self.drop(self.ff(_ln(x)))
 
 
+QUANTUM_ENCODINGS = ("amplitude", "angle")
+QUANTUM_READOUTS = ("state", "prob", "expval_z")
+# Must stay in sync with SearchSpaceConfig.quantum_gate_sets / _entangle_patterns.
+QUANTUM_GATE_SETS = ("rx_ry", "rx_ry_rz")
+QUANTUM_ENTANGLE_PATTERNS = ("linear", "circular")
+
+# Compiled quantum circuits, shared process-wide and keyed on the circuit's
+# configuration. Deliberately module-level, never instance state: the value is a
+# tc.interfaces.torch_interface closure, which pickle cannot reference by name, so
+# anything reachable from a block's __dict__ would break sending models between
+# processes. QuantumMixBlock.__getstate__ already drops its own reference.
+#
+# Sharing is sound because the compiled function takes the trainable weights as an
+# ARGUMENT (qpred_batch(x_batch, weights)) and closes over nothing genome-specific —
+# only the seven fields in the key below.
+#
+# Two costs are avoided per re-use, both measured on the pre-cache code:
+#   ~5000 ms  first compile of a configuration
+#   ~600 ms   each additional input shape (T = B*N varies because the dataloaders
+#             use drop_last=False, so the last batch of an epoch is short)
+# Without this, every block instance paid both — roughly 8 s per genome evaluation.
+#
+# Eviction: strict LRU, least-recently-used discarded once the cap is reached.
+# Eviction is a pure time/memory trade and never affects correctness — an evicted
+# configuration simply recompiles on next use. The cap matters because the distinct
+# configuration space grows once encoding/readout/n_qubits are genes, and each entry
+# retains its compiled graphs plus one trace per input shape it has seen.
+_CIRCUIT_CACHE_MAXSIZE = 16
+_CIRCUIT_CACHE: "OrderedDict[tuple, Any]" = OrderedDict()
+
+
+def _compile_qpred(
+    n_qubits: int,
+    nlayers: int,
+    entangle_pattern: str,
+    gate_set: str,
+    encoding: str,
+    readout: str,
+    reupload: bool,
+):
+    """Build and JIT-compile one per-token circuit. No reference to any block."""
+    # NumPy 2.0 removed the top-level np.ComplexWarning alias; the class itself
+    # still exists at numpy.exceptions.ComplexWarning. Older tensorcircuit
+    # releases reference the top-level alias at import time, so we restore it
+    # before the import if missing.
+    import numpy as _np
+    if not hasattr(_np, "ComplexWarning"):
+        _np.ComplexWarning = _np.exceptions.ComplexWarning
+
+    # TF startup emits abseil ABSL_RAW_LOG lines via write(2,...) — these
+    # cannot be suppressed with env vars, so we swap fd 2 during init.
+    with _silence_raw_stderr():
+        try:
+            import tensorcircuit as tc
+        except ImportError:
+            raise ImportError(
+                "tensorcircuit is required for QuantumMixBlock. "
+                "Install with:  pip install tensorcircuit"
+            ) from None
+
+        K = tc.set_backend("tensorflow")
+
+    n = int(n_qubits)
+    nlayers = int(nlayers)
+    pattern = str(entangle_pattern)
+    gpl = 3 if gate_set == "rx_ry_rz" else 2  # gates per layer
+
+    def qpred_batch(x_batch, weights):
+        # x_batch : [T, 2^n] amplitude vectors, or [T, n] rotation angles
+        #           (T = B*N tokens)
+        # weights : [gpl*nlayers, n]  shared trainable rotation angles
+        # Returns : [T, readout_width]  vectorised over T
+
+        def run_single(x):
+            if encoding == "amplitude":
+                c = tc.Circuit(n, inputs=K.cast(x, "complex64"))
+            else:
+                c = tc.Circuit(n)  # |0...0>
+
+            for j in range(nlayers):
+                # entanglement layer
+                for i in range(n - 1):
+                    c.cnot(i, i + 1)
+                if pattern == "circular" and n > 2:
+                    c.cnot(n - 1, 0)
+                # trainable rotations, with the token folded into the angle
+                # when encoding == "angle" (first layer only unless reupload)
+                inject = encoding == "angle" and (reupload or j == 0)
+                for i in range(n):
+                    theta = weights[gpl * j, i] + x[i] if inject else weights[gpl * j, i]
+                    c.rx(i, theta=theta)
+                    c.ry(i, theta=weights[gpl * j + 1, i])
+                    if gpl == 3:
+                        c.rz(i, theta=weights[gpl * j + 2, i])
+
+            if readout == "state":
+                # real part of the [2^n] output amplitudes
+                return K.real(c.state())
+            if readout == "prob":
+                # psi * conj(psi), not abs(psi)**2: abs has a gradient
+                # singularity at zero that produces NaNs.
+                psi = c.state()
+                return K.real(psi * K.conj(psi))
+            # expval_z: <Z_i> per qubit -> [n]
+            return K.stack([K.real(c.expectation_ps(z=[i])) for i in range(n)])
+
+        # vmap over the token batch axis; weights are broadcast (shared)
+        return K.vmap(run_single)(x_batch)
+
+    return tc.interfaces.torch_interface(qpred_batch, jit=True)
+
+
+def _get_qpred(
+    *,
+    n_qubits: int,
+    nlayers: int,
+    entangle_pattern: str,
+    gate_set: str,
+    encoding: str,
+    readout: str,
+    reupload: bool,
+):
+    """Return the compiled circuit for this configuration, compiling on a miss."""
+    key = (int(n_qubits), int(nlayers), str(entangle_pattern), str(gate_set),
+           str(encoding), str(readout), bool(reupload))
+
+    cached = _CIRCUIT_CACHE.get(key)
+    if cached is not None:
+        _CIRCUIT_CACHE.move_to_end(key)  # mark most-recently-used
+        return cached
+
+    fn = _compile_qpred(
+        n_qubits=n_qubits, nlayers=nlayers, entangle_pattern=entangle_pattern,
+        gate_set=gate_set, encoding=encoding, readout=readout, reupload=reupload,
+    )
+    _CIRCUIT_CACHE[key] = fn
+    while len(_CIRCUIT_CACHE) > _CIRCUIT_CACHE_MAXSIZE:
+        _CIRCUIT_CACHE.popitem(last=False)  # evict least-recently-used
+    return fn
+
+
+def circuit_cache_info() -> dict:
+    """Introspection for tests and debugging: current size, cap, and keys."""
+    return {
+        "size": len(_CIRCUIT_CACHE),
+        "maxsize": _CIRCUIT_CACHE_MAXSIZE,
+        "keys": list(_CIRCUIT_CACHE),
+    }
+
+
+def clear_circuit_cache() -> None:
+    """Drop every compiled circuit. Used by tests that need a cold cache."""
+    _CIRCUIT_CACHE.clear()
+
+
 class QuantumMixBlock(nn.Module):
     """
-    Quantum feature mixer via amplitude encoding + state vector readout.
+    Quantum feature mixer. Encoding and readout are searchable genes.
 
-    Each token [D] is L2-normalised and encoded as the amplitude vector of an
-    n = log2(D) qubit state.  After the parameterised circuit runs, the full
-    output state vector (2^n = D real amplitudes) is read out — no projection
-    needed, no information bottleneck.  The state vector is used as a
-    multiplicative gate:  x = x * (1 + tanh(gate_norm(q_sv)))
+    Encodings
+      "amplitude": the token is L2-normalised and loaded as the initial state of an
+          n-qubit register (2^n amplitudes). The token never reaches a rotation
+          angle, so the circuit is a fixed unitary and the map is exactly linear:
+          out = Re(U(theta)) @ x. Verified numerically (additivity ~1e-7).
+      "angle": the circuit starts in |0...0> and the token is projected to n
+          rotation angles that are ADDED to the trainable weights, so the circuit
+          itself depends on the input and the map is genuinely non-linear.
+          Angles are bounded to one period via pi*tanh: an unbounded projection
+          drifts past 2*pi during training and aliases, mapping distinct tokens to
+          identical circuits with no error raised.
+
+    Readouts (width in brackets)
+      "state"    [2^n]  Re(psi)              — current default; simulator-only
+      "prob"     [2^n]  Re(psi * conj(psi))  — sums to 1, lives on the simplex
+      "expval_z" [n]    <Z_i> per qubit      — the only physically measurable one
+
+    The readout drives a multiplicative gate, x = x * (1 + tanh(gate_norm(.))),
     which initialises to identity and can amplify or suppress each feature.
 
-    D must be a power of 2 — guaranteed by repair_genome.
+    Projections are built here, never lazily in forward: a layer created during
+    forward is missing from state_dict at load time and from the optimizer at
+    construction time. With the default spec (amplitude + state, n = log2(d_model))
+    both are None and the tensor path is identical to the pre-gene implementation.
+
     Circuit is built and JIT-compiled on first forward (lazy import of tc).
     """
 
@@ -400,17 +573,85 @@ class QuantumMixBlock(nn.Module):
         use_ffn: bool,
         ff_mult: float,
         dropout: float,
+        encoding: str = "amplitude",
+        readout: str = "state",
+        n_qubits: int = 0,
+        reupload: bool = False,
     ):
         super().__init__()
-        assert (d_model & (d_model - 1)) == 0 and d_model > 0, (
-            f"QuantumMixBlock requires d_model to be a power of 2, got {d_model}"
-        )
+        d_model = int(d_model)
+        encoding = str(encoding)
+        readout = str(readout)
+        n_qubits = int(n_qubits)
 
-        self.n_qubits = int(math.log2(d_model))
+        if encoding not in QUANTUM_ENCODINGS:
+            raise ValueError(
+                f"QuantumMixBlock: unknown encoding {encoding!r}, expected one of {list(QUANTUM_ENCODINGS)}"
+            )
+        if readout not in QUANTUM_READOUTS:
+            raise ValueError(
+                f"QuantumMixBlock: unknown readout {readout!r}, expected one of {list(QUANTUM_READOUTS)}"
+            )
+        # Validated for the same reason as encoding/readout: the circuit selects the
+        # gate count with `3 if gate_set == "rx_ry_rz" else 2` and the entangler with
+        # `pattern == "circular"`, so an unrecognised value would silently fall through
+        # to rx_ry / linear and train a different circuit than the genome describes.
+        if str(gate_set) not in QUANTUM_GATE_SETS:
+            raise ValueError(
+                f"QuantumMixBlock: unknown gate_set {gate_set!r}, "
+                f"expected one of {list(QUANTUM_GATE_SETS)}"
+            )
+        if str(entangle_pattern) not in QUANTUM_ENTANGLE_PATTERNS:
+            raise ValueError(
+                f"QuantumMixBlock: unknown entangle_pattern {entangle_pattern!r}, "
+                f"expected one of {list(QUANTUM_ENTANGLE_PATTERNS)}"
+            )
+        if encoding == "angle" and n_qubits <= 0:
+            # Deriving log2(d_model) here would silently give angle encoding a very
+            # narrow circuit; repair_genome is responsible for assigning the width.
+            raise ValueError(
+                "QuantumMixBlock: angle encoding requires an explicit n_qubits > 0 "
+                f"(got {n_qubits}); repair_genome assigns it from quantum_angle_qubits_range"
+            )
+
+        if n_qubits > 0:
+            self.n_qubits = n_qubits
+        else:
+            # Amplitude encoding with no projection loads the token directly as the
+            # state vector, so the register must be exactly wide enough to hold it.
+            if (d_model & (d_model - 1)) != 0 or d_model <= 0:
+                raise ValueError(
+                    "QuantumMixBlock: amplitude encoding without an explicit n_qubits "
+                    f"requires d_model to be a power of 2, got {d_model}"
+                )
+            self.n_qubits = int(math.log2(d_model))
+
+        self.d_model = d_model
+        self.encoding = encoding
+        self.readout = readout
+        self.reupload = bool(reupload)
         self.nlayers = int(nlayers)
         self.entangle_pattern = str(entangle_pattern)
         self.gate_set = str(gate_set)  # "rx_ry" | "rx_ry_rz"
         self.use_ffn = bool(use_ffn)
+
+        state_width = 2 ** self.n_qubits
+        self.readout_width = self.n_qubits if readout == "expval_z" else state_width
+
+        # ---- input projection (None on the default path) ----
+        if encoding == "angle":
+            # q_weights already supplies a learnable additive per-qubit offset on
+            # theta, so a bias here would duplicate that degree of freedom.
+            self.in_proj: Optional[nn.Module] = nn.Linear(d_model, self.n_qubits, bias=False)
+        elif state_width != d_model:
+            self.in_proj = nn.Linear(d_model, state_width)
+        else:
+            self.in_proj = None
+
+        # ---- readout projection (None on the default path) ----
+        self.out_proj: Optional[nn.Module] = (
+            None if self.readout_width == d_model else nn.Linear(self.readout_width, d_model)
+        )
 
         # Weight rows per circuit layer: 2 for rx_ry, 3 for rx_ry_rz
         gates_per_layer = 3 if self.gate_set == "rx_ry_rz" else 2
@@ -418,8 +659,7 @@ class QuantumMixBlock(nn.Module):
             torch.empty(gates_per_layer * self.nlayers, self.n_qubits).uniform_(-math.pi, math.pi)
         )
 
-        # State vector readout gives [D] per token — no proj layer needed.
-        # gate_norm normalises quantum amplitudes before the multiplicative gate.
+        # gate_norm normalises the readout before the multiplicative gate.
         self.norm = nn.LayerNorm(d_model)
         self.gate_norm = nn.LayerNorm(d_model)
         self.drop = nn.Dropout(float(dropout))
@@ -440,59 +680,21 @@ class QuantumMixBlock(nn.Module):
 
     # ------------------------------------------------------------------
     def _build_circuit(self) -> None:
-        """Compile the per-token quantum circuit (called once; JIT-cached by tc)."""
-        # NumPy 2.0 removed the top-level np.ComplexWarning alias; the class itself
-        # still exists at numpy.exceptions.ComplexWarning. Older tensorcircuit
-        # releases reference the top-level alias at import time, so we restore it
-        # before the import if missing.
-        import numpy as _np
-        if not hasattr(_np, "ComplexWarning"):
-            _np.ComplexWarning = _np.exceptions.ComplexWarning
+        """Fetch (or compile) the per-token circuit for this block's configuration.
 
-        # TF startup emits abseil ABSL_RAW_LOG lines via write(2,...) — these
-        # cannot be suppressed with env vars, so we swap fd 2 during init.
-        with _silence_raw_stderr():
-            try:
-                import tensorcircuit as tc
-            except ImportError:
-                raise ImportError(
-                    "tensorcircuit is required for QuantumMixBlock. "
-                    "Install with:  pip install tensorcircuit"
-                ) from None
-
-            K = tc.set_backend("tensorflow")
-        n = self.n_qubits
-        nlayers = self.nlayers
-        pattern = self.entangle_pattern
-        gate_set = self.gate_set
-        gpl = 3 if gate_set == "rx_ry_rz" else 2  # gates per layer
-
-        def qpred_batch(x_batch, weights):
-            # x_batch : [T, 2^n]  T = B*N tokens, normalised amplitude vectors
-            # weights : [gpl*nlayers, n]  shared trainable rotation angles
-            # Returns : [T, n]   Z-expectation per qubit, vectorised over T
-
-            def run_single(x):
-                c = tc.Circuit(n, inputs=K.cast(x, "complex64"))
-                for j in range(nlayers):
-                    # entanglement layer
-                    for i in range(n - 1):
-                        c.cnot(i, i + 1)
-                    if pattern == "circular" and n > 2:
-                        c.cnot(n - 1, 0)
-                    # trainable rotations
-                    for i in range(n):
-                        c.rx(i, theta=weights[gpl * j, i])
-                        c.ry(i, theta=weights[gpl * j + 1, i])
-                        if gpl == 3:
-                            c.rz(i, theta=weights[gpl * j + 2, i])
-                # Full state vector readout: real part of [2^n = D] amplitudes
-                return K.real(c.state())
-
-            # vmap over the token batch axis; weights are broadcast (shared)
-            return K.vmap(run_single)(x_batch)
-
-        self._qpred_torch = tc.interfaces.torch_interface(qpred_batch, jit=True)
+        The compiled function is shared process-wide across every block with the
+        same configuration — see _get_qpred. It is assigned to self._qpred_torch as
+        before, and __getstate__ still drops it, so pickling behaviour is unchanged.
+        """
+        self._qpred_torch = _get_qpred(
+            n_qubits=self.n_qubits,
+            nlayers=self.nlayers,
+            entangle_pattern=self.entangle_pattern,
+            gate_set=self.gate_set,
+            encoding=self.encoding,
+            readout=self.readout,
+            reupload=self.reupload,
+        )
 
     # ------------------------------------------------------------------
     def __getstate__(self):
@@ -518,15 +720,26 @@ class QuantumMixBlock(nn.Module):
         h = self.norm(x)
         h_flat = h.reshape(B * N, D)
 
-        # L2-normalise each token so it represents a valid quantum state
-        norms = h_flat.norm(dim=1, keepdim=True).clamp(min=1e-8)
-        h_norm = h_flat / norms  # [B*N, D]
+        if self.encoding == "amplitude":
+            if self.in_proj is not None:
+                h_flat = self.in_proj(h_flat)  # [B*N, 2^n]
+            # L2-normalise each token so it represents a valid quantum state
+            norms = h_flat.norm(dim=1, keepdim=True).clamp(min=1e-8)
+            q_in = h_flat / norms
+        else:
+            # Angles, not a state vector: no L2 normalisation. pi*tanh bounds the
+            # projection to one full rotation period so training cannot push it
+            # past 2*pi, where distinct tokens would alias onto the same circuit.
+            q_in = math.pi * torch.tanh(self.in_proj(h_flat))  # [B*N, n]
 
-        # Single vectorised call — state vector readout gives [B*N, D] directly
-        q_sv = self._qpred_torch(h_norm, self.q_weights)  # [B*N, D]
+        # Single vectorised call over all tokens
+        q_out = self._qpred_torch(q_in, self.q_weights)  # [B*N, readout_width]
+
+        if self.out_proj is not None:
+            q_out = self.out_proj(q_out)  # [B*N, D]
 
         # Multiplicative gate: 1 + tanh maps to (0, 2), initialises at 1 (identity)
-        gate = 1.0 + torch.tanh(self.gate_norm(q_sv.reshape(B, N, D)))
+        gate = 1.0 + torch.tanh(self.gate_norm(q_out.reshape(B, N, D)))
         x = x * gate
 
         if self.ff is not None:
@@ -580,6 +793,10 @@ def make_block(spec: BlockSpec, genome: Genome, *, activation: str = "gelu") -> 
         entangle = str(getattr(q_spec, "entangle_pattern", "linear")) if q_spec is not None else "linear"
         gate_set = str(getattr(q_spec, "gate_set", "rx_ry")) if q_spec is not None else "rx_ry"
         use_ffn = bool(getattr(q_spec, "use_ffn", True)) if q_spec is not None else True
+        encoding = str(getattr(q_spec, "encoding", "amplitude")) if q_spec is not None else "amplitude"
+        readout = str(getattr(q_spec, "readout", "state")) if q_spec is not None else "state"
+        n_qubits = int(getattr(q_spec, "n_qubits", 0)) if q_spec is not None else 0
+        reupload = bool(getattr(q_spec, "reupload", False)) if q_spec is not None else False
         return QuantumMixBlock(
             d_model=d_model,
             nlayers=nlayers,
@@ -588,6 +805,10 @@ def make_block(spec: BlockSpec, genome: Genome, *, activation: str = "gelu") -> 
             use_ffn=use_ffn,
             ff_mult=_block_ff_mult(spec, genome),
             dropout=dropout,
+            encoding=encoding,
+            readout=readout,
+            n_qubits=n_qubits,
+            reupload=reupload,
         )
 
     raise ValueError(f"Unknown block_type={spec.block_type!r}")

@@ -132,6 +132,19 @@ class SearchSpaceConfig:
     quantum_gate_sets: List[str] = field(default_factory=lambda: ["rx_ry", "rx_ry_rz"])
     quantum_use_ffn_options: List[bool] = field(default_factory=lambda: [True, False])
 
+    # TODO(phase-3): the two qubit ranges below are PLACEHOLDERS. Set them from
+    # tools/bench_quantum.py measurements before enabling the encoding/readout genes
+    # in mutation and repair. Simulation cost is 2^n complex amplitudes per token,
+    # vmapped over B*N tokens, so an over-wide range makes workers OOM — and a worker
+    # OOM surfaces as inf fitness, indistinguishable from a genuinely bad architecture.
+    # Amplitude and angle get separate ranges deliberately: amplitude packs 2^n values
+    # into n qubits, angle only n, so angle needs a wider circuit for the same capacity.
+    quantum_encodings: List[str] = field(default_factory=lambda: ["amplitude", "angle"])
+    quantum_readouts: List[str] = field(default_factory=lambda: ["state", "prob", "expval_z"])
+    quantum_amplitude_qubits_range: Tuple[int, int] = (8, 8)   # PLACEHOLDER
+    quantum_angle_qubits_range: Tuple[int, int] = (8, 8)       # PLACEHOLDER
+    quantum_reupload_options: List[bool] = field(default_factory=lambda: [True, False])
+
     # ---- Stages (for genome_v2) ----
     stage_count_range: Tuple[int, int] = (1, 3)
     stage_tokenizers: List[str] = field(default_factory=lambda: ["time", "var", "patch", "cross"])
