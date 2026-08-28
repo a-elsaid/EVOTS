@@ -711,11 +711,13 @@ class StagedForecastModel(nn.Module):
         self.raw_time = TimeTokenHead(task.d_in, genome.model_dim, pos_encoding="none", dropout=genome.dropout)
 
         self.stage_modules = nn.ModuleList()
-        for st in genome.stages:
+        for i, st in enumerate(genome.stages):
             tok = make_tokenizer(task, genome, st)
             core = TransformerStack(genome, st.blocks, activation="gelu")
-            retok = CrossAttentionRetokenizer(genome.model_dim, genome.num_heads, genome.dropout) \
-                if st.retokenize == "cross_attn" else nn.Identity()
+            # Stage 0 has no predecessor; every later stage retokenizes against prev_tokens
+            # so earlier stages feed forward (prevents orphaning — issue #3).
+            retok = nn.Identity() if i == 0 else CrossAttentionRetokenizer(
+                genome.model_dim, genome.num_heads, genome.dropout)
             self.stage_modules.append(nn.ModuleDict({"tok": tok, "retok": retok, "core": core}))
 
         if genome.stages[0].tokenizer == "var":

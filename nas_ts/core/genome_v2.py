@@ -134,7 +134,9 @@ class StageSpec:
     # "time" | "var" | "patch" | "cross"
     tokenizer: str = "time"
 
-    # cross-attention re-tokenization between tokenizer and core blocks
+    # cross-attention re-tokenization between tokenizer and core blocks.
+    # Not searched: repair_genome() sets this from the stage index —
+    # stage0 -> "none" (no predecessor), every stage i>=1 -> "cross_attn".
     retokenize: str = "none"   # "none" | "cross_attn" | "conv" | "fft"
 
     # core blocks used after tokenization (Transformer-style blocks)

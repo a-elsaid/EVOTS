@@ -20,16 +20,12 @@ def _random_block(ss: SearchSpaceConfig) -> BlockSpec:
 def _random_stage(ss: SearchSpaceConfig, name: str, *, is_stage0: bool = False) -> StageSpec:
     # Use config-driven choices (falls back safely if missing)
     tok_choices = getattr(ss, "stage_tokenizers", ["time", "var", "patch", "cross"])
-    retok_choices = getattr(ss, "stage_retokens", ["none", "cross_attn"])
 
     tokenizer = random.choice(tok_choices)
 
-    # Stage0 should not retokenize; repair() will enforce tool
-    # (keept simple here to avoid combinatorial explosion in mutation)
-    if is_stage0:
-        retokenize = "none"
-    else:
-        retokenize = random.choice(retok_choices)
+    # retokenize is position-determined, not searched: stage0 has no predecessor,
+    # every later stage consumes prev_tokens. repair() re-enforces this.
+    retokenize = "none" if is_stage0 else "cross_attn"
 
     blocks = [_random_block(ss)]
     return StageSpec(name=name, tokenizer=tokenizer, retokenize=retokenize, blocks=blocks)
@@ -118,7 +114,8 @@ def mutate_genome(
     """
     Stage-native mutation for Genome v2.
     - Mutates global params occasionally
-    - Mutates stages: add/remove stage, change tokenizer, toggle retokenize, edit blocks
+    - Mutates stages: add/remove stage, change tokenizer, edit blocks
+      (retokenize is not searched — it is position-determined; see repair_genome)
     - When tokenizer requires a head ("var"/"cross"), enables + randomizes the head spec.
     - Always ends with repair_genome() to enforce invariants.
     """
@@ -179,7 +176,6 @@ def mutate_genome(
     st = random.choice(g.stages)
 
     tok_choices = getattr(ss, "stage_tokenizers", ["time", "var", "patch", "cross"])
-    retok_choices = getattr(ss, "stage_retokens", ["none", "cross_attn"])
 
     if random.random() < mr:
         st.tokenizer = random.choice(tok_choices)
@@ -189,12 +185,6 @@ def mutate_genome(
             _maybe_randomize_var_head(g, ss)
         elif st.tokenizer == "cross":
             _maybe_randomize_cross_head(g, ss)
-
-    if random.random() < mr:
-        if st is g.stages[0]:
-            st.retokenize = "none"
-        else:
-            st.retokenize = random.choice(retok_choices)
 
     if st.blocks is None:
         st.blocks = [_random_block(ss)]

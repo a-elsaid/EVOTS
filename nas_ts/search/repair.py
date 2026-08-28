@@ -37,7 +37,7 @@ def repair_genome(genome: Genome, ss: SearchSpaceConfig) -> Genome:
     """
     Enforces structural invariants on a v2 genome:
       - stages exists and has >= 1 stage
-      - stage0.retokenize == "none"
+      - retokenize is position-determined: stage0 == "none", every stage i>=1 == "cross_attn"
       - each stage has >= 1 valid BlockSpec
       - tokenizers respect family constraints and search space
       - var_head / cross_head enabled iff used by a stage
@@ -60,13 +60,14 @@ def repair_genome(genome: Genome, ss: SearchSpaceConfig) -> Genome:
 
     # 2) Fix invalid stage fields
     valid_tokenizers = set(getattr(ss, "stage_tokenizers", ["time", "var", "patch", "cross"]))
-    valid_retok = set(getattr(ss, "stage_retokens", ["none", "cross_attn"]))
 
     for i, st in enumerate(genome.stages):
         if st.tokenizer not in valid_tokenizers:
             st.tokenizer = "time"
 
-        st.retokenize = "none" if i == 0 else (st.retokenize if st.retokenize in valid_retok else "none")
+        # Position-determined, not searched: stage0 has no predecessor, every later
+        # stage must consume prev_tokens or it orphans its predecessors (issue #3).
+        st.retokenize = "none" if i == 0 else "cross_attn"
 
         if not st.blocks:
             st.blocks = [_random_block(ss)]

@@ -135,6 +135,7 @@ class SearchSpaceConfig:
     # ---- Stages (for genome_v2) ----
     stage_count_range: Tuple[int, int] = (1, 3)
     stage_tokenizers: List[str] = field(default_factory=lambda: ["time", "var", "patch", "cross"])
+    # No longer searched: retokenize is position-determined (stage0="none", i>=1="cross_attn") per issue #3.
     stage_retokens: List[str] = field(default_factory=lambda: ["none", "cross_attn"])
 
     # ---- CrossToken head search knobs (for tokenizer="cross") ----
