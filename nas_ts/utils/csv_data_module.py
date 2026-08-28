@@ -35,6 +35,7 @@ def _read_tabular_file(path: str, cfg: CSVDataConfig) -> pd.DataFrame:
             header=None if cfg.has_header is False else "infer",
             sep=cfg.delimiter,
             engine="python",
+            comment="#",
         )
         return df
 

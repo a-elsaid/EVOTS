@@ -97,7 +97,24 @@ def _get_optimizer(model: nn.Module, eval_cfg: EvalConfig):
         return torch.optim.AdamW(model.parameters(), **kwargs)
     else:
         raise ValueError(f"Unsupported optimizer: {eval_cfg.optimizer}")
-    
+
+
+def _load_state_checked(model: nn.Module, state: dict, *, where: str) -> None:
+    """load_state_dict(strict=False) that refuses to drop keys silently.
+
+    Every load in this file used to swallow mismatches, which is how a tokenizer
+    projection could be discarded on load and re-initialised at random without a
+    single line of output.
+    """
+    incompatible = model.load_state_dict(state, strict=False)
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        logger.warning(
+            f"[Load:{where}] state_dict mismatch — "
+            f"missing={list(incompatible.missing_keys)} "
+            f"unexpected={list(incompatible.unexpected_keys)}"
+        )
+
+
 
 def _train_and_eval_on_dataset(
     genome: Genome,
@@ -128,7 +145,7 @@ def _train_and_eval_on_dataset(
 
     if init_state_dict_cpu is not None:
         try:
-            model.load_state_dict(init_state_dict_cpu, strict=False)
+            _load_state_checked(model, init_state_dict_cpu, where="WeightInherit")
             logger.info("[WeightInherit] Loaded init state_dict into model")
         except Exception as e:
             logger.warning(f"[WeightInherit] Failed to load init weights: {e}")
@@ -220,7 +237,7 @@ def _train_and_eval_on_dataset(
 
     # restore best weights if we have them
     if best_state is not None:
-        model.load_state_dict(best_state, strict=False)
+        _load_state_checked(model, best_state, where="EarlyStopRestore")
 
     # -------------------------
     # Final Validation Metrics (+ latency)
@@ -348,7 +365,9 @@ def finetune_and_test(
     model = build_model_from_meta(genome, task, meta)
     model.to(device)
     if initial_state_dict_cpu is not None:
-        model.load_state_dict(initial_state_dict_cpu, strict=False)
+        # Rebuilt from the genome, so any mismatch is a real architecture/weights
+        # disagreement and must not be papered over.
+        model.load_state_dict(initial_state_dict_cpu, strict=True)
 
     optimizer = _get_optimizer(model, eval_cfg)
     mse_crit = nn.MSELoss()
@@ -403,7 +422,7 @@ def finetune_and_test(
 
         # ---- early stopping logic ----
         if val_mse < best_val_mse - early_stop_min_delta:
-            search_best_val_mse = val_mse # to avoid logging confusion in the next elif
+            search_best_val_mse = val_mse  # keeps the "worse than" log wording meaningful
             best_val_mse = val_mse
             best_state_cpu = {k: v.detach().cpu() for k, v in model.state_dict().items()}
             patience_left = early_stop_patience
@@ -412,21 +431,23 @@ def finetune_and_test(
                 f"[Finetune] Step {step:5d} | "
                 f"val_mse improved → {best_val_mse:.6f}"
             )
-        elif val_mse > search_best_val_mse :
-            logger.debug(
-                f"[Finetune] Step {step:5d}/{extra_training_steps} | "
-                f"val_mse improved (search) → {val_mse:.6f}"
-                f" (Search Best: {search_best_val_mse:.6f})"
-            )
         else:
+            # Not an improvement. This must decrement patience whether val_mse is
+            # above or below search_best_val_mse — splitting those into separate
+            # branches left the "above" case without a decrement, so patience never
+            # ran out and early stopping could never fire.
             patience_left -= 1
+            if val_mse > search_best_val_mse:
+                worse_than, reference = "search best", search_best_val_mse
+            else:
+                worse_than, reference = "current best", best_val_mse
             logger.debug(
                 f"[Finetune] Step {step:5d}/{extra_training_steps} | "
-                f"val_mse={val_mse:.6f} | "
-                f"patience left={patience_left}"
+                f"val_mse={val_mse:.6f} did not improve (worse than {worse_than}: "
+                f"{reference:.6f}) | patience left={patience_left}"
             )
 
-            if patience_left <= 0:
+            if can_early_stop and patience_left <= 0:
                 logger.info(
                     f"[Finetune] Early stopping triggered at step {step} "
                     f"(best_val_mse={best_val_mse:.6f})"
@@ -435,14 +456,29 @@ def finetune_and_test(
 
     # ---- restore best weights ----
     if best_state_cpu is not None:
-        model.load_state_dict(best_state_cpu, strict=False)
+        _load_state_checked(model, best_state_cpu, where="FinetuneRestore")
         logger.info(
             f"[Finetune] Restored best model "
             f"(val_mse={best_val_mse:.6f})"
         )
-    else:
+    elif initial_state_dict_cpu is not None:
+        # Reassigning best_state_cpu alone left `model` holding the final-step weights,
+        # so the model that got tested was not the one whose weights were returned and
+        # saved. Load them back so test_mse describes the state_dict we hand out.
+        _load_state_checked(model, initial_state_dict_cpu, where="FinetuneRestoreInitial")
         best_state_cpu = initial_state_dict_cpu
-        logger.warning("[Finetune] No validation improvement recorded; using last model")
+        logger.warning(
+            "[Finetune] No validation improvement recorded; restored the search "
+            "winner's weights and testing those."
+        )
+    else:
+        # Nothing to restore — the search never saved a package. Return the weights we
+        # actually test rather than None, which would be saved as the checkpoint.
+        best_state_cpu = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+        logger.warning(
+            "[Finetune] No validation improvement and no initial state was supplied; "
+            "testing and returning the final-step weights."
+        )
 
     # ---- test evaluation ----
     model.eval()

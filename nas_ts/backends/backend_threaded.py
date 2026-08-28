@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, Future
 
@@ -11,6 +12,7 @@ from .backend_base import EvaluationBackend
 from ..core.config import ExperimentConfig
 from ..evaluate.evaluate import evaluate_genome
 from ..utils.weight_pool import WeightPool
+from ..utils.model_package import ModelPackage
 
 
 class ThreadedBackend(EvaluationBackend):
@@ -80,15 +82,28 @@ class ThreadedBackend(EvaluationBackend):
 
             if isinstance(out, tuple) and len(out) == 3:
                 metrics, state, meta = out
-                metrics["state_dict_cpu"] = state
-                metrics["meta"] = meta
+                pkg_dir = (
+                    Path(self.exp_cfg.run_info.logs_dir)
+                    / self.exp_cfg.run_info.name
+                    / "packages"
+                )
+                pkg_path = ModelPackage.from_state_dict(
+                    genome, state, meta=meta, metrics=metrics
+                ).save(pkg_dir / f"{indiv_id}.pt")
+                # Leading underscore keeps this out of the JSON metric logs.
+                metrics["_package_path"] = str(pkg_path)
                 return indiv_id, metrics
 
             return indiv_id, out
 
-        except Exception:
+        except Exception as e:
             logger.exception(f"Worker({worker_id}) error in indiv {indiv_id}")
-            raise
+            return indiv_id, {
+                "mse": float("inf"),
+                "mae": float("inf"),
+                "params": float("inf"),
+                "worker_error": str(e),
+            }
 
     def submit(self, indiv_id: str, genome: Any):
         if self._shutdown:
@@ -107,10 +122,21 @@ class ThreadedBackend(EvaluationBackend):
                     done_futures.append(fut)
 
         for fut in done_futures:
-            indiv_id, metrics = fut.result()
-            completed.append((indiv_id, metrics))
             with self._lock:
-                del self._future_to_id[fut]
+                indiv_id = self._future_to_id.pop(fut, None)
+            if indiv_id is None:
+                continue
+            try:
+                _, metrics = fut.result()
+                completed.append((indiv_id, metrics))
+            except Exception as e:
+                logger.exception(f"[ThreadedBackend] Future failed for indiv_id={indiv_id}")
+                completed.append((indiv_id, {
+                    "mse": float("inf"),
+                    "mae": float("inf"),
+                    "params": float("inf"),
+                    "worker_error": str(e),
+                }))
 
         return completed
 

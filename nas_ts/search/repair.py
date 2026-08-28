@@ -2,7 +2,7 @@ from __future__ import annotations
 import random
 
 from ..core.config import SearchSpaceConfig
-from ..core.genome_v2 import Genome, StageSpec, BlockSpec
+from ..core.genome_v2 import Genome, StageSpec, BlockSpec, ConvBlockSpec, QuantumBlockSpec
 
 
 def _round_pow2(x: int) -> int:
@@ -37,7 +37,7 @@ def repair_genome(genome: Genome, ss: SearchSpaceConfig) -> Genome:
     """
     Enforces structural invariants on a v2 genome:
       - stages exists and has >= 1 stage
-      - stage0.retokenize == "none"
+      - retokenize is position-determined: stage0 == "none", every stage i>=1 == "cross_attn"
       - each stage has >= 1 valid BlockSpec
       - tokenizers respect family constraints and search space
       - var_head / cross_head enabled iff used by a stage
@@ -60,13 +60,14 @@ def repair_genome(genome: Genome, ss: SearchSpaceConfig) -> Genome:
 
     # 2) Fix invalid stage fields
     valid_tokenizers = set(getattr(ss, "stage_tokenizers", ["time", "var", "patch", "cross"]))
-    valid_retok = set(getattr(ss, "stage_retokens", ["none", "cross_attn"]))
 
     for i, st in enumerate(genome.stages):
         if st.tokenizer not in valid_tokenizers:
             st.tokenizer = "time"
 
-        st.retokenize = "none" if i == 0 else (st.retokenize if st.retokenize in valid_retok else "none")
+        # Position-determined, not searched: stage0 has no predecessor, every later
+        # stage must consume prev_tokens or it orphans its predecessors (issue #3).
+        st.retokenize = "none" if i == 0 else "cross_attn"
 
         if not st.blocks:
             st.blocks = [_random_block(ss)]
@@ -120,7 +121,58 @@ def repair_genome(genome: Genome, ss: SearchSpaceConfig) -> Genome:
         if hasattr(ss, "var_decomp_kernels") and genome.var_head.decomp_kernel not in ss.var_decomp_kernels:
             genome.var_head.decomp_kernel = random.choice(list(ss.var_decomp_kernels))
 
-    # 7) Repair cross_head params
+    # 7) Repair conv_block params
+    was_conv_enabled = genome.conv_block.enabled
+    genome.conv_block.enabled = any(
+        b.block_type == "conv" for st in genome.stages for b in st.blocks
+    )
+
+    if genome.conv_block.enabled:
+        if not was_conv_enabled:
+            # Newly enabled — randomize so we explore the kernel/dilation space
+            if hasattr(ss, "conv_kernel_sizes") and ss.conv_kernel_sizes:
+                genome.conv_block.kernel_size = random.choice(list(ss.conv_kernel_sizes))
+            if hasattr(ss, "conv_dilations") and ss.conv_dilations:
+                genome.conv_block.dilation = random.choice(list(ss.conv_dilations))
+        else:
+            # Already enabled — only fix out-of-range values
+            if hasattr(ss, "conv_kernel_sizes") and genome.conv_block.kernel_size not in ss.conv_kernel_sizes:
+                genome.conv_block.kernel_size = random.choice(list(ss.conv_kernel_sizes))
+            if hasattr(ss, "conv_dilations") and genome.conv_block.dilation not in ss.conv_dilations:
+                genome.conv_block.dilation = random.choice(list(ss.conv_dilations))
+
+    # 9) Repair quantum_block params
+    was_q_enabled = genome.quantum_block.enabled
+    genome.quantum_block.enabled = any(
+        b.block_type == "quantum" for st in genome.stages for b in st.blocks
+    )
+
+    if genome.quantum_block.enabled:
+        valid_patterns = list(getattr(ss, "quantum_entangle_patterns", ["linear", "circular"]))
+        valid_ffn = list(getattr(ss, "quantum_use_ffn_options", [True, False]))
+        nlayers_range = getattr(ss, "quantum_nlayers_range", (1, 3))
+
+        valid_gate_sets = list(getattr(ss, "quantum_gate_sets", ["rx_ry", "rx_ry_rz"]))
+
+        if not was_q_enabled:
+            # Newly enabled — randomise all knobs
+            genome.quantum_block.nlayers = random.randint(int(nlayers_range[0]), int(nlayers_range[1]))
+            genome.quantum_block.entangle_pattern = random.choice(valid_patterns)
+            genome.quantum_block.gate_set = random.choice(valid_gate_sets)
+            genome.quantum_block.use_ffn = random.choice(valid_ffn)
+        else:
+            # Already enabled — only fix out-of-range values
+            lo, hi = int(nlayers_range[0]), int(nlayers_range[1])
+            if not (lo <= genome.quantum_block.nlayers <= hi):
+                genome.quantum_block.nlayers = random.randint(lo, hi)
+            if genome.quantum_block.entangle_pattern not in valid_patterns:
+                genome.quantum_block.entangle_pattern = random.choice(valid_patterns)
+            if genome.quantum_block.gate_set not in valid_gate_sets:
+                genome.quantum_block.gate_set = random.choice(valid_gate_sets)
+            if genome.quantum_block.use_ffn not in valid_ffn:
+                genome.quantum_block.use_ffn = random.choice(valid_ffn)
+
+    # 10) Repair cross_head params
     if genome.cross_head.enabled:
         if hasattr(ss, "cross_groups") and genome.cross_head.groups not in ss.cross_groups:
             genome.cross_head.groups = random.choice(list(ss.cross_groups))

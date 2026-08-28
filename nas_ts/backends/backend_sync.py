@@ -23,4 +23,7 @@ class SyncBackend(EvaluationBackend):
         completed = self._completed
         self._completed = []
         return completed
+
+    def shutdown(self, wait: bool = True) -> None:
+        pass
     

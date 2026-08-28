@@ -25,3 +25,7 @@ class EvaluationBackend(ABC):
         Each element: (indiv_id, metrics_dict)
         """
         pass
+
+    def shutdown(self, wait: bool = True) -> None:
+        """Release any worker processes / threads. Safe to call multiple times."""
+        pass

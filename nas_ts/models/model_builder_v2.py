@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import math
+import os
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import torch
@@ -9,6 +11,26 @@ import torch.nn.functional as F
 
 from ..core.config import TaskConfig
 from ..core.genome_v2 import Genome, BlockSpec, StageSpec, PatchingSpec
+
+
+@contextlib.contextmanager
+def _silence_raw_stderr():
+    """Redirect fd 2 to /dev/null for the duration of the block.
+
+    abseil's ABSL_RAW_LOG writes directly via write(2,...) and cannot be
+    suppressed by env vars or Python's logging machinery.  Swapping fd 2 at the
+    OS level is the only reliable fix.  Python exceptions still propagate
+    normally — only raw C-level writes are swallowed.
+    """
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    saved = os.dup(2)
+    os.dup2(devnull, 2)
+    os.close(devnull)
+    try:
+        yield
+    finally:
+        os.dup2(saved, 2)
+        os.close(saved)
 
 
 def _ln(x: torch.Tensor) -> torch.Tensor:
@@ -86,7 +108,11 @@ class PatchTokenHead(nn.Module):
         self.p = int(patching.patch_size)
         self.s = int(patching.stride) if int(patching.stride) > 0 else int(patching.patch_size)
         self.D = int(D)
-        self.proj: Optional[nn.Linear] = None
+        self.d_in = int(d_in)
+        # Padding below is along L only, so the flattened patch is always
+        # patch_size * d_in wide. Built here (not lazily in forward) so the layer
+        # is present in state_dict at load time and visible to the optimizer.
+        self.proj = nn.Linear(self.p * self.d_in, self.D)
         self.drop = nn.Dropout(float(dropout))
 
     def forward(self, x: torch.Tensor, x_mark: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -105,8 +131,11 @@ class PatchTokenHead(nn.Module):
         B2, N, p2, Din2 = patches.shape
         flat = patches.reshape(B2, N, p2 * Din2)
 
-        if self.proj is None or self.proj.in_features != flat.size(-1):
-            self.proj = nn.Linear(flat.size(-1), self.D).to(x.device)
+        if flat.size(-1) != self.proj.in_features:
+            raise ValueError(
+                f"PatchTokenHead expected in_features={self.proj.in_features} "
+                f"(patch_size={self.p} * d_in={self.d_in}), got {flat.size(-1)}"
+            )
 
         return self.drop(self.proj(flat))
 
@@ -151,7 +180,12 @@ class CrossTokenHead(nn.Module):
         self.encoder_type = getattr(cross_head_spec, "encoder_type", "linear")
         self.pool = getattr(cross_head_spec, "pool", "avg")
 
-        self.proj_linear: Optional[nn.Linear] = None
+        # Each group is ceil(d_in / groups) wide after padding, and pooling in
+        # forward() collapses the patch axis, so the projection input is always
+        # group_width. Built here (not lazily in forward) so the layer is present
+        # in state_dict at load time and visible to the optimizer.
+        self.group_width = int(math.ceil(int(d_in) / self.groups))
+        self.proj_linear = nn.Linear(self.group_width, self.D)
         k = int(getattr(cross_head_spec, "conv_kernel", 3))
         self.conv = nn.Conv1d(1, 8, kernel_size=k, padding=k // 2)
         self.conv_proj = nn.Linear(8, self.D)
@@ -191,8 +225,11 @@ class CrossTokenHead(nn.Module):
             tok = self.conv_proj(z)
         else:
             pooled = tokens_raw.mean(dim=1)
-            if self.proj_linear is None or self.proj_linear.in_features != pooled.size(-1):
-                self.proj_linear = nn.Linear(pooled.size(-1), self.D).to(x.device)
+            if pooled.size(-1) != self.group_width:
+                raise ValueError(
+                    f"CrossTokenHead expected group_width={self.group_width} "
+                    f"(ceil(d_in / groups={self.groups})), got {pooled.size(-1)}"
+                )
             tok = self.proj_linear(pooled)
 
         tok = self.drop(self.ln(tok))
@@ -304,14 +341,24 @@ class StandardAttnBlock(nn.Module):
 
 
 class ConvTokenMixBlock(nn.Module):
-    """Depthwise conv over token axis followed by pointwise projection (conv block type)."""
+    """
+    Depthwise-separable conv token mixer with optional dilation.
 
-    def __init__(self, d_model: int, kernel_size: int, ff_mult: float, dropout: float):
+    Receptive field = dilation * (kernel_size - 1) + 1.
+    Larger dilation captures longer-range token dependencies at zero extra params.
+    """
+
+    def __init__(self, d_model: int, kernel_size: int, dilation: int, ff_mult: float, dropout: float):
         super().__init__()
         d_model = int(d_model)
         k = int(kernel_size)
+        d = int(dilation)
+        padding = d * (k - 1) // 2          # same-length output for any k / dilation
         self.norm = nn.LayerNorm(d_model)
-        self.dwconv = nn.Conv1d(d_model, d_model, kernel_size=k, padding=k // 2, groups=d_model)
+        self.dwconv = nn.Conv1d(
+            d_model, d_model,
+            kernel_size=k, padding=padding, dilation=d, groups=d_model,
+        )
         self.pw = nn.Linear(d_model, d_model)
         self.drop = nn.Dropout(float(dropout))
         hidden = int(d_model * float(ff_mult))
@@ -327,6 +374,165 @@ class ConvTokenMixBlock(nn.Module):
         y = self.pw(self.dwconv(h.transpose(1, 2)).transpose(1, 2))
         x = x + self.drop(y)
         return x + self.drop(self.ff(_ln(x)))
+
+
+class QuantumMixBlock(nn.Module):
+    """
+    Quantum feature mixer via amplitude encoding + state vector readout.
+
+    Each token [D] is L2-normalised and encoded as the amplitude vector of an
+    n = log2(D) qubit state.  After the parameterised circuit runs, the full
+    output state vector (2^n = D real amplitudes) is read out — no projection
+    needed, no information bottleneck.  The state vector is used as a
+    multiplicative gate:  x = x * (1 + tanh(gate_norm(q_sv)))
+    which initialises to identity and can amplify or suppress each feature.
+
+    D must be a power of 2 — guaranteed by repair_genome.
+    Circuit is built and JIT-compiled on first forward (lazy import of tc).
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        nlayers: int,
+        entangle_pattern: str,
+        gate_set: str,
+        use_ffn: bool,
+        ff_mult: float,
+        dropout: float,
+    ):
+        super().__init__()
+        assert (d_model & (d_model - 1)) == 0 and d_model > 0, (
+            f"QuantumMixBlock requires d_model to be a power of 2, got {d_model}"
+        )
+
+        self.n_qubits = int(math.log2(d_model))
+        self.nlayers = int(nlayers)
+        self.entangle_pattern = str(entangle_pattern)
+        self.gate_set = str(gate_set)  # "rx_ry" | "rx_ry_rz"
+        self.use_ffn = bool(use_ffn)
+
+        # Weight rows per circuit layer: 2 for rx_ry, 3 for rx_ry_rz
+        gates_per_layer = 3 if self.gate_set == "rx_ry_rz" else 2
+        self.q_weights = nn.Parameter(
+            torch.empty(gates_per_layer * self.nlayers, self.n_qubits).uniform_(-math.pi, math.pi)
+        )
+
+        # State vector readout gives [D] per token — no proj layer needed.
+        # gate_norm normalises quantum amplitudes before the multiplicative gate.
+        self.norm = nn.LayerNorm(d_model)
+        self.gate_norm = nn.LayerNorm(d_model)
+        self.drop = nn.Dropout(float(dropout))
+
+        if self.use_ffn:
+            hidden = int(d_model * float(ff_mult))
+            self.ff: Optional[nn.Module] = nn.Sequential(
+                nn.Linear(d_model, hidden),
+                nn.GELU(),
+                nn.Dropout(float(dropout)),
+                nn.Linear(hidden, d_model),
+            )
+        else:
+            self.ff = None
+
+        # Built on first forward; not part of module state (reconstructible from hparams)
+        self._qpred_torch = None
+
+    # ------------------------------------------------------------------
+    def _build_circuit(self) -> None:
+        """Compile the per-token quantum circuit (called once; JIT-cached by tc)."""
+        # NumPy 2.0 removed the top-level np.ComplexWarning alias; the class itself
+        # still exists at numpy.exceptions.ComplexWarning. Older tensorcircuit
+        # releases reference the top-level alias at import time, so we restore it
+        # before the import if missing.
+        import numpy as _np
+        if not hasattr(_np, "ComplexWarning"):
+            _np.ComplexWarning = _np.exceptions.ComplexWarning
+
+        # TF startup emits abseil ABSL_RAW_LOG lines via write(2,...) — these
+        # cannot be suppressed with env vars, so we swap fd 2 during init.
+        with _silence_raw_stderr():
+            try:
+                import tensorcircuit as tc
+            except ImportError:
+                raise ImportError(
+                    "tensorcircuit is required for QuantumMixBlock. "
+                    "Install with:  pip install tensorcircuit"
+                ) from None
+
+            K = tc.set_backend("tensorflow")
+        n = self.n_qubits
+        nlayers = self.nlayers
+        pattern = self.entangle_pattern
+        gate_set = self.gate_set
+        gpl = 3 if gate_set == "rx_ry_rz" else 2  # gates per layer
+
+        def qpred_batch(x_batch, weights):
+            # x_batch : [T, 2^n]  T = B*N tokens, normalised amplitude vectors
+            # weights : [gpl*nlayers, n]  shared trainable rotation angles
+            # Returns : [T, n]   Z-expectation per qubit, vectorised over T
+
+            def run_single(x):
+                c = tc.Circuit(n, inputs=K.cast(x, "complex64"))
+                for j in range(nlayers):
+                    # entanglement layer
+                    for i in range(n - 1):
+                        c.cnot(i, i + 1)
+                    if pattern == "circular" and n > 2:
+                        c.cnot(n - 1, 0)
+                    # trainable rotations
+                    for i in range(n):
+                        c.rx(i, theta=weights[gpl * j, i])
+                        c.ry(i, theta=weights[gpl * j + 1, i])
+                        if gpl == 3:
+                            c.rz(i, theta=weights[gpl * j + 2, i])
+                # Full state vector readout: real part of [2^n = D] amplitudes
+                return K.real(c.state())
+
+            # vmap over the token batch axis; weights are broadcast (shared)
+            return K.vmap(run_single)(x_batch)
+
+        self._qpred_torch = tc.interfaces.torch_interface(qpred_batch, jit=True)
+
+    # ------------------------------------------------------------------
+    def __getstate__(self):
+        # tc.interfaces.torch_interface returns a closure (torch_interface.<locals>.Fun)
+        # which pickle cannot reference by name, so a model that has run a forward
+        # pass is otherwise unpicklable. It is rebuilt from hyperparameters on the
+        # next forward and never appears in state_dict(), so dropping it is lossless.
+        state = dict(self.__dict__)
+        state["_qpred_torch"] = None
+        return state
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        self._qpred_torch = None
+
+    # ------------------------------------------------------------------
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._qpred_torch is None:
+            self._build_circuit()
+
+        B, N, D = x.shape
+
+        h = self.norm(x)
+        h_flat = h.reshape(B * N, D)
+
+        # L2-normalise each token so it represents a valid quantum state
+        norms = h_flat.norm(dim=1, keepdim=True).clamp(min=1e-8)
+        h_norm = h_flat / norms  # [B*N, D]
+
+        # Single vectorised call — state vector readout gives [B*N, D] directly
+        q_sv = self._qpred_torch(h_norm, self.q_weights)  # [B*N, D]
+
+        # Multiplicative gate: 1 + tanh maps to (0, 2), initialises at 1 (identity)
+        gate = 1.0 + torch.tanh(self.gate_norm(q_sv.reshape(B, N, D)))
+        x = x * gate
+
+        if self.ff is not None:
+            x = x + self.drop(self.ff(_ln(x)))
+
+        return x
 
 
 def _block_dim(spec: BlockSpec, genome: Genome) -> int:
@@ -356,10 +562,33 @@ def make_block(spec: BlockSpec, genome: Genome, *, activation: str = "gelu") -> 
     if bt in {"conv", "conv1d"}:
         conv_spec = getattr(genome, "conv_block", None)
         kernel = int(getattr(conv_spec, "kernel_size", 3)) if conv_spec is not None else 3
-        return ConvTokenMixBlock(d_model=d_model, kernel_size=kernel, ff_mult=_block_ff_mult(spec, genome), dropout=dropout)
+        dilation = int(getattr(conv_spec, "dilation", 1)) if conv_spec is not None else 1
+        return ConvTokenMixBlock(
+            d_model=d_model,
+            kernel_size=kernel,
+            dilation=dilation,
+            ff_mult=_block_ff_mult(spec, genome),
+            dropout=dropout,
+        )
 
     if bt in {"freq", "fft", "decomp", "cross_dim", "crossdim"}:
         return nn.Identity()
+
+    if bt in {"quantum", "qattn", "q"}:
+        q_spec = getattr(genome, "quantum_block", None)
+        nlayers = int(getattr(q_spec, "nlayers", 2)) if q_spec is not None else 2
+        entangle = str(getattr(q_spec, "entangle_pattern", "linear")) if q_spec is not None else "linear"
+        gate_set = str(getattr(q_spec, "gate_set", "rx_ry")) if q_spec is not None else "rx_ry"
+        use_ffn = bool(getattr(q_spec, "use_ffn", True)) if q_spec is not None else True
+        return QuantumMixBlock(
+            d_model=d_model,
+            nlayers=nlayers,
+            entangle_pattern=entangle,
+            gate_set=gate_set,
+            use_ffn=use_ffn,
+            ff_mult=_block_ff_mult(spec, genome),
+            dropout=dropout,
+        )
 
     raise ValueError(f"Unknown block_type={spec.block_type!r}")
 
@@ -482,11 +711,13 @@ class StagedForecastModel(nn.Module):
         self.raw_time = TimeTokenHead(task.d_in, genome.model_dim, pos_encoding="none", dropout=genome.dropout)
 
         self.stage_modules = nn.ModuleList()
-        for st in genome.stages:
+        for i, st in enumerate(genome.stages):
             tok = make_tokenizer(task, genome, st)
             core = TransformerStack(genome, st.blocks, activation="gelu")
-            retok = CrossAttentionRetokenizer(genome.model_dim, genome.num_heads, genome.dropout) \
-                if st.retokenize == "cross_attn" else nn.Identity()
+            # Stage 0 has no predecessor; every later stage retokenizes against prev_tokens
+            # so earlier stages feed forward (prevents orphaning — issue #3).
+            retok = nn.Identity() if i == 0 else CrossAttentionRetokenizer(
+                genome.model_dim, genome.num_heads, genome.dropout)
             self.stage_modules.append(nn.ModuleDict({"tok": tok, "retok": retok, "core": core}))
 
         if genome.stages[0].tokenizer == "var":

@@ -24,6 +24,7 @@ from nas_ts.search.engine import EvolutionEngine
 from nas_ts.core.config_loader import load_cfg, build_experiment
 from nas_ts.utils.plot_results import plot_run
 from nas_ts.utils.weight_pool import WeightPool
+from nas_ts.utils.model_package import ModelPackage
 from nas_ts.utils.devices import auto_detect_device
 
 
@@ -94,13 +95,14 @@ def main():
     exp_logger.save_config_copy(args.config)
     exp_logger.save_resolved_config(cfg)
 
-    final_pop, best_indiv = engine.run()
+    try:
+        final_pop, best_indiv = engine.run()
+    finally:
+        backend.shutdown(wait=True)
+        logger.info("[Run] Backend shutdown complete.")
 
     if best_indiv is None:
         raise RuntimeError("No best individual found (no completed evaluations?)")
-
-    backend.shutdown(wait=True)
-    logger.info("[Run] Backend shutdown complete.")
 
     individuals = sorted(
         [ind for ind in final_pop.get_all() if ind.metrics is not None],
@@ -114,12 +116,34 @@ def main():
         logger.info(f"  mse={ind.metrics['mse']:.4f}, params={ind.metrics['params']:.0f}")
         logger.info(f"  family={ind.genome.family}, depth={depth}")
 
+    # Continue from the search winner's trained weights. Without this the
+    # finetune silently restarts from a random init and its validation error
+    # bears no relation to what the worker achieved.
+    best_state = None
+    if engine.best_package_path is not None:
+        pkg = ModelPackage.load(engine.best_package_path)
+        best_state = pkg.state_dict
+        # Weights and architecture must come from the same package; the two can
+        # diverge only if the overall best individual crashed before saving one.
+        if pkg.genome_dict != best_indiv.genome.to_dict():
+            raise RuntimeError(
+                f"[Run] Best package genome does not match the best individual "
+                f"(genome_id={best_indiv.genome.id}, package={engine.best_package_path}). "
+                f"Refusing to finetune weights against a different architecture."
+            )
+        logger.info(f"[Run] Finetuning from best package: {engine.best_package_path}")
+    else:
+        logger.warning(
+            "[Run] No best package was saved during the search. "
+            "Finetune will start from a random initialization."
+        )
+
     extra_steps = cfg.get("eval", {}).get("extra_training_steps", 2000)
     test_metrics, finetuned_state, meta = finetune_and_test(
         best_fitness=best_indiv.fitness,
         genome=best_indiv.genome,
         exp_cfg=exp_cfg,
-        initial_state_dict_cpu=None,
+        initial_state_dict_cpu=best_state,
         extra_training_steps=extra_steps,
     )
 

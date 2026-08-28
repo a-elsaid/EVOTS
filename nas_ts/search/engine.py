@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Optional
 import torch
 import json
@@ -23,6 +24,7 @@ from ..core.population import Population
 from ..backends.backend_base import EvaluationBackend
 from ..utils.logger import Logger
 from ..utils.checkpoint import save_checkpoint
+from ..utils.model_package import ModelPackage
 from .selection_ops import tournament_selection, find_worst
 from .evolution_ops import reproduce
 from .genome_init import random_genome
@@ -65,6 +67,11 @@ class EvolutionEngine:
         self.best_eval_id = None
         self.best_genome_id = None
 
+        # Tracked separately from best_fitness: step() lowers best_fitness before
+        # calling _maybe_save_best(), so comparing against it there would never fire.
+        self.best_saved_fitness = None
+        self.best_package_path = None
+
         # Prefer saving inside the run folder you're already using:
         # logs_dir/run_name/...
         if self.checkpoint_dir is None and self.logger_obj is not None:
@@ -72,6 +79,24 @@ class EvolutionEngine:
 
         if self.checkpoint_dir is not None:
             Path(self.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------
+    # Package housekeeping
+    # ------------------------------------------
+    @staticmethod
+    def _prune_package(path) -> None:
+        """Delete a superseded model package.
+
+        One package is written per evaluation, so without this the run directory
+        grows by a full model checkpoint on every eval. Only the best-so-far
+        package is ever read again.
+        """
+        if not path:
+            return
+        try:
+            Path(path).unlink(missing_ok=True)
+        except OSError as e:
+            logger.warning(f"[Engine] Could not remove package {path}: {e}")
 
     # ------------------------------------------
     # Helper to save best individual seen so far
@@ -88,17 +113,24 @@ class EvolutionEngine:
         if indiv.fitness is None:
             return
 
-        # Need the returned weights from the evaluator
+        # Need the trained weights from the evaluator, as a package on disk
         metrics = indiv.metrics or {}
-        state = metrics.get("state_dict_cpu", None)
-        if state is None:
+        package_path = metrics.get("_package_path", None)
+        if package_path is None:
             return
 
-        is_better = (self.best_fitness is None) or (indiv.fitness < self.best_fitness)
+        is_better = (self.best_saved_fitness is None) or (indiv.fitness < self.best_saved_fitness)
         if not is_better:
             return
 
-        self.best_fitness = float(indiv.fitness)
+        package = ModelPackage.load(package_path)
+        state = package.state_dict
+
+        superseded = self.best_package_path
+        self.best_saved_fitness = float(indiv.fitness)
+        self.best_package_path = str(package_path)
+        if superseded and superseded != self.best_package_path:
+            self._prune_package(superseded)
         self.best_eval_id = int(metrics.get("eval_id", -1))
         self.best_genome_id = getattr(indiv, "id", None)
 
@@ -108,9 +140,9 @@ class EvolutionEngine:
         payload = {
             "eval_id": self.best_eval_id,
             "generation": int(metrics.get("generation", -1)),
-            "fitness": self.best_fitness,
+            "fitness": self.best_saved_fitness,
             "metrics": {k: v for k, v in metrics.items() if not k.startswith("_")},
-            "meta": metrics.get("meta", None),
+            "meta": package.meta,
             "model_state_dict": state,
             "genome": indiv.genome.to_dict() if hasattr(indiv, "genome") else None,
         }
@@ -123,8 +155,9 @@ class EvolutionEngine:
                 {
                     "eval_id": self.best_eval_id,
                     "generation": payload["generation"],
-                    "fitness": self.best_fitness,
+                    "fitness": self.best_saved_fitness,
                     "genome_id": self.best_genome_id,
+                    "package_path": self.best_package_path,
                 },
                 f,
                 indent=2,
@@ -189,12 +222,10 @@ class EvolutionEngine:
         num_completed = 0
 
         for indiv_id, metrics in completed:
-            # Completed job must exist in submitted
             indiv = self.submitted.pop(indiv_id, None)
-            
-            # if indiv is None:
-                # logger.warning(f"[Engine] Received completion for unknown indiv_id {indiv_id}. Ignoring.")
-                # ...
+            if indiv is None:
+                logger.warning(f"[Engine] Completion for unknown indiv_id={indiv_id}. Skipping.")
+                continue
                 
 
             # Attach eval_id + generation fields
@@ -206,9 +237,12 @@ class EvolutionEngine:
 
             indiv.metrics = metrics
 
-            # indiv.metrics = metrics
-            # if "state_dict_cpu" not in metrics:
-            #     logger.warning(f"[Engine] Missing state_dict_cpu for indiv {indiv_id}. Best checkpoint will NOT be saved.")
+            if "_package_path" not in metrics:
+                logger.warning(
+                    f"[Engine] Missing _package_path for indiv {indiv_id}. "
+                    f"Trained weights did not reach the main process; "
+                    f"best checkpoint will NOT be saved."
+                )
 
             # Fitness for single-objective
             if sel_cfg.mode == "single":
@@ -242,6 +276,12 @@ class EvolutionEngine:
 
             # Maybe save best-so-far checkpoint
             self._maybe_save_best(indiv)
+
+            # Drop this individual's package unless it is the current best.
+            pkg_path = metrics.get("_package_path", None)
+            if pkg_path and pkg_path != self.best_package_path:
+                self._prune_package(pkg_path)
+                metrics.pop("_package_path", None)
 
             # Console log
             if indiv.fitness is not None:
@@ -316,7 +356,8 @@ class EvolutionEngine:
 
             # Run until we have COMPLETED max_evals (not just submitted)
             while self.eval_count < evo.max_evals:
-                self.step()
+                if self.step() == 0:
+                    time.sleep(0.05)
 
                 new_evals = self.eval_count - last_eval_count
                 if new_evals > 0:

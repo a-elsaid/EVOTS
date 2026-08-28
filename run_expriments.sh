@@ -71,7 +71,24 @@ run4data() {
     done
 }
 
-DATA_DIR="data/iTransformer_datasets"
+DATA_DIR="/Users/a.e./Dropbox/evots/data/iTransformer_datasets"
+
+
+#############################
+# *** DATA FILES: Weather ***
+#############################
+has_head=true
+use_indx=false
+date="0"
+
+ett_in_params=($weather_mon $weather_mul $weather_mul)
+ett_out_params=($weather_mon $weather_mon $weather_mul)
+
+#-----------------------------
+data_file=$DATA_DIR/weather/weather.csv
+name=weather.csv
+run4data
+#-----------------------------
 
 #########################
 # *** DATA FILES: ETT ***
@@ -155,23 +172,6 @@ ett_out_params=($traffic_mon $traffic_mon $traffic_mul)
 #-----------------------------
 data_file=$DATA_DIR/traffic/traffic.csv
 name=traffic
-run4data
-#-----------------------------
-
-
-#############################
-# *** DATA FILES: Weather ***
-#############################
-has_head=true
-use_indx=false
-date="0"
-
-ett_in_params=($weather_mon $weather_mul $weather_mul)
-ett_out_params=($weather_mon $weather_mon $weather_mul)
-
-#-----------------------------
-data_file=$DATA_DIR/weather/weather.csv
-name=weather.csv
 run4data
 #-----------------------------
 

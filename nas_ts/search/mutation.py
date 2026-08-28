@@ -20,16 +20,12 @@ def _random_block(ss: SearchSpaceConfig) -> BlockSpec:
 def _random_stage(ss: SearchSpaceConfig, name: str, *, is_stage0: bool = False) -> StageSpec:
     # Use config-driven choices (falls back safely if missing)
     tok_choices = getattr(ss, "stage_tokenizers", ["time", "var", "patch", "cross"])
-    retok_choices = getattr(ss, "stage_retokens", ["none", "cross_attn"])
 
     tokenizer = random.choice(tok_choices)
 
-    # Stage0 should not retokenize; repair() will enforce tool
-    # (keept simple here to avoid combinatorial explosion in mutation)
-    if is_stage0:
-        retokenize = "none"
-    else:
-        retokenize = random.choice(retok_choices)
+    # retokenize is position-determined, not searched: stage0 has no predecessor,
+    # every later stage consumes prev_tokens. repair() re-enforces this.
+    retokenize = "none" if is_stage0 else "cross_attn"
 
     blocks = [_random_block(ss)]
     return StageSpec(name=name, tokenizer=tokenizer, retokenize=retokenize, blocks=blocks)
@@ -55,6 +51,34 @@ def _maybe_randomize_var_head(g: Genome, ss: SearchSpaceConfig) -> None:
     elif g.var_head.encoder_type == "decomp_linear":
         ks = list(getattr(ss, "var_decomp_kernels", [3, 5, 7]))
         g.var_head.decomp_kernel = int(random.choice(ks))
+
+
+def _maybe_randomize_quantum_block(g: Genome, ss: SearchSpaceConfig) -> None:
+    """Randomise quantum_block knobs whenever a block is switched to type 'quantum'."""
+    g.quantum_block.enabled = True
+
+    nlayers_range = getattr(ss, "quantum_nlayers_range", (1, 3))
+    g.quantum_block.nlayers = random.randint(int(nlayers_range[0]), int(nlayers_range[1]))
+
+    patterns = list(getattr(ss, "quantum_entangle_patterns", ["linear", "circular"]))
+    g.quantum_block.entangle_pattern = random.choice(patterns)
+
+    gate_sets = list(getattr(ss, "quantum_gate_sets", ["rx_ry", "rx_ry_rz"]))
+    g.quantum_block.gate_set = random.choice(gate_sets)
+
+    ffn_opts = list(getattr(ss, "quantum_use_ffn_options", [True, False]))
+    g.quantum_block.use_ffn = random.choice(ffn_opts)
+
+
+def _maybe_randomize_conv_block(g: Genome, ss: SearchSpaceConfig) -> None:
+    """Randomize conv_block knobs whenever a block is switched to type 'conv'."""
+    g.conv_block.enabled = True
+
+    kernels = list(getattr(ss, "conv_kernel_sizes", [3, 5, 7]))
+    g.conv_block.kernel_size = int(random.choice(kernels))
+
+    dilations = list(getattr(ss, "conv_dilations", [1]))
+    g.conv_block.dilation = int(random.choice(dilations))
 
 
 def _maybe_randomize_cross_head(g: Genome, ss: SearchSpaceConfig) -> None:
@@ -90,7 +114,8 @@ def mutate_genome(
     """
     Stage-native mutation for Genome v2.
     - Mutates global params occasionally
-    - Mutates stages: add/remove stage, change tokenizer, toggle retokenize, edit blocks
+    - Mutates stages: add/remove stage, change tokenizer, edit blocks
+      (retokenize is not searched — it is position-determined; see repair_genome)
     - When tokenizer requires a head ("var"/"cross"), enables + randomizes the head spec.
     - Always ends with repair_genome() to enforce invariants.
     """
@@ -118,6 +143,14 @@ def mutate_genome(
     # if random.random() < mr:
     #     g.family = random.choice(ss.families)
 
+    # conv_block knob mutation (only when already active)
+    if g.conv_block.enabled and random.random() < mr:
+        _maybe_randomize_conv_block(g, ss)
+
+    # quantum_block knob mutation (only when already active)
+    if g.quantum_block.enabled and random.random() < mr:
+        _maybe_randomize_quantum_block(g, ss)
+
     # -------------------------
     # stage mutations
     # -------------------------
@@ -127,7 +160,7 @@ def mutate_genome(
     if len(g.stages) == 0:
         g.stages.append(_random_stage(ss, "stage0", is_stage0=True))
 
-    min_stages, max_stages = getattr(ss, "stage_count_range", (1, 3))
+    min_stages, max_stages = getattr(ss, "stage_count_range")
     min_stages = max(1, int(min_stages))
     max_stages = max(min_stages, int(max_stages))
 
@@ -143,7 +176,6 @@ def mutate_genome(
     st = random.choice(g.stages)
 
     tok_choices = getattr(ss, "stage_tokenizers", ["time", "var", "patch", "cross"])
-    retok_choices = getattr(ss, "stage_retokens", ["none", "cross_attn"])
 
     if random.random() < mr:
         st.tokenizer = random.choice(tok_choices)
@@ -153,12 +185,6 @@ def mutate_genome(
             _maybe_randomize_var_head(g, ss)
         elif st.tokenizer == "cross":
             _maybe_randomize_cross_head(g, ss)
-
-    if random.random() < mr:
-        if st is g.stages[0]:
-            st.retokenize = "none"
-        else:
-            st.retokenize = random.choice(retok_choices)
 
     if st.blocks is None:
         st.blocks = [_random_block(ss)]
@@ -172,6 +198,10 @@ def mutate_genome(
     if random.random() < mr and len(st.blocks) > 0:
         b = random.choice(st.blocks)
         b.block_type = random.choice(ss.block_types)
+        if b.block_type == "conv":
+            _maybe_randomize_conv_block(g, ss)
+        elif b.block_type == "quantum":
+            _maybe_randomize_quantum_block(g, ss)
 
     # -------------------------
     # constraints on total blocks across stages
