@@ -88,6 +88,7 @@ def build_experiment(cfg: dict) -> ExperimentConfig:
         npz_key=cfg["data"]["csv"].get("npz_key", None),
         use_col_indices=cfg["data"]["csv"].get("use_col_indices", False),
         date_col=cfg["data"]["csv"].get("date_col", "date"),
+        max_rows=cfg["data"]["csv"].get("max_rows", None),
     )
 
     csv_ds_cfg = DatasetConfig(

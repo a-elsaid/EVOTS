@@ -233,6 +233,10 @@ def make_csv_dataloaders(cfg: CSVDataConfig):
     df_all = df[all_cols].apply(pd.to_numeric, errors="coerce").dropna(axis=1, how="all")
 
     values = torch.tensor(df_all.values, dtype=torch.float32)
+    if cfg.max_rows is not None:
+        values = values[:cfg.max_rows]
+        if marks_full is not None:
+            marks_full = marks_full[:cfg.max_rows]
     T, D_all = values.shape
 
     col_to_idx = {c: i for i, c in enumerate(df_all.columns)}

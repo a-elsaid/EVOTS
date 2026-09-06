@@ -19,6 +19,7 @@ data:
     target_cols: ["HUFL","HULL","MUFL","MULL","LUFL","LULL","OT"]
     train_ratio: 0.7
     val_ratio: 0.1
+    max_rows: null  # e.g. 14400 for ETTh1/h2, 57600 for ETTm1/m2 (paper protocol)
     batch_size: 32
     num_workers: 0
     normalize: true

@@ -44,6 +44,7 @@ class CSVDataConfig:
     target_cols: Optional[Sequence[str]] = None
     train_ratio: float = 0.7
     val_ratio: float = 0.1
+    max_rows: Optional[int] = None  # clip series to this many rows before splitting (e.g. 14400 for ETTh paper protocol)
     batch_size: int = 32
     num_workers: int = 1
     normalize: bool = True
