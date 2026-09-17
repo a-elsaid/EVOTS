@@ -35,9 +35,13 @@ def print_config_summary(cfg: dict):
         logger.info(f"\n--- {section.upper()} ---")
         for k, v in cfg[section].items():
             logger.info(f"{section}.{k}: {v}")
-    logger.info("\n--- DATA.CSV ---")
-    for k, v in cfg["data"]["csv"].items():
-        logger.info(f"data.csv.{k}: {v}")
+    for source, params in cfg.get("data", {}).items():
+        logger.info(f"\n--- DATA.{source.upper()} ---")
+        if isinstance(params, dict):
+            for k, v in params.items():
+                logger.info(f"data.{source}.{k}: {v}")
+        else:
+            logger.info(f"data.{source}: {params}")
     logger.info("\n--- SEARCH SPACE ---")
     for k, v in cfg["search_space"].items():
         logger.info(f"search_space.{k}: {v}")
@@ -113,7 +117,14 @@ def main():
     for i, ind in enumerate(individuals):
         depth = sum(len(st.blocks) for st in ind.genome.stages)
         logger.info(f"Rank {i+1}: id={ind.id}")
-        logger.info(f"  mse={ind.metrics['mse']:.4f}, params={ind.metrics['params']:.0f}")
+        params = ind.metrics.get("params", float("nan"))
+        if cfg.get("task", {}).get("task_type") == "classification":
+            loss = ind.metrics.get("loss", float("nan"))
+            acc = ind.metrics.get("accuracy", float("nan"))
+            logger.info(f"  loss={loss:.4f}, accuracy={acc:.4f}, params={params:.0f}")
+        else:
+            mse = ind.metrics.get("mse", float("nan"))
+            logger.info(f"  mse={mse:.4f}, params={params:.0f}")
         logger.info(f"  family={ind.genome.family}, depth={depth}")
 
     # Continue from the search winner's trained weights. Without this the
