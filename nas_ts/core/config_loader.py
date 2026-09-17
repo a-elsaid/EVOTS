@@ -90,7 +90,6 @@ def build_experiment(cfg: dict) -> ExperimentConfig:
                 "(WindowNorm divides by ~0 at input_length=1 and silently "
                 "zeroes every feature)."
             )
-
         tab_cfg = cfg["data"]["tabular"]
         tab_dm_cfg = TabularDataConfig(
             path=tab_cfg["path"],
@@ -130,6 +129,7 @@ def build_experiment(cfg: dict) -> ExperimentConfig:
             npz_key=cfg["data"]["csv"].get("npz_key", None),
             use_col_indices=cfg["data"]["csv"].get("use_col_indices", False),
             date_col=cfg["data"]["csv"].get("date_col", "date"),
+            max_rows=cfg["data"]["csv"].get("max_rows", None),
         )
         ds_cfg = DatasetConfig(
             name="CSV",

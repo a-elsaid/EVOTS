@@ -44,6 +44,7 @@ class CSVDataConfig:
     target_cols: Optional[Sequence[str]] = None
     train_ratio: float = 0.7
     val_ratio: float = 0.1
+    max_rows: Optional[int] = None  # clip series to this many rows before splitting (e.g. 14400 for ETTh paper protocol)
     batch_size: int = 32
     num_workers: int = 1
     normalize: bool = True
@@ -135,6 +136,7 @@ class SearchSpaceConfig:
     # ---- Stages (for genome_v2) ----
     stage_count_range: Tuple[int, int] = (1, 3)
     stage_tokenizers: List[str] = field(default_factory=lambda: ["time", "var", "patch", "cross"])
+    # No longer searched: retokenize is position-determined (stage0="none", i>=1="cross_attn") per issue #3.
     stage_retokens: List[str] = field(default_factory=lambda: ["none", "cross_attn"])
 
     # ---- CrossToken head search knobs (for tokenizer="cross") ----

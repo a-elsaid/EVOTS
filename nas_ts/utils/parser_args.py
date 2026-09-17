@@ -32,6 +32,7 @@ HELP_SET_TEXT = (
     "  data.csv.target_cols    (list[str] | null, default=null)\n"
     "  data.csv.train_ratio    (float, default=0.7)\n"
     "  data.csv.val_ratio      (float, default=0.1)\n"
+    "  data.csv.max_rows       (int | null, default=null)  clip series before splitting; e.g. 14400 for ETTh paper protocol\n"
     "  data.csv.batch_size     (int, default=32)\n"
     "  data.csv.num_workers    (int, default=1)\n"
     "  data.csv.normalize      (bool, default=true)\n\n"
