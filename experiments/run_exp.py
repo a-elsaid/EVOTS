@@ -170,12 +170,17 @@ def main():
     best_indiv.genome.dump_structure(run_dir / f"{run_name}__best_finetuned.genome.json")
     logger.info(f"[Final] test_metrics={test_metrics}")
 
-    plot_run(
-        run_dir,
-        exp_cfg=exp_cfg,
-        also_plot_predictions=True,
-        best_kind="best_finetuned",
-    )
+    # Plotting is a reporting step after every metric is already written; a
+    # failure here must not take down a completed run.
+    try:
+        plot_run(
+            run_dir,
+            exp_cfg=exp_cfg,
+            also_plot_predictions=True,
+            best_kind="best_finetuned",
+        )
+    except Exception:
+        logger.exception("[Run] Plotting failed; run results are unaffected.")
 
 
 if __name__ == "__main__":

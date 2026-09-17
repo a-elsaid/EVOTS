@@ -237,6 +237,14 @@ def plot_run(
     if also_plot_predictions:
         if exp_cfg is None:
             raise ValueError("exp_cfg is required to plot predictions")
+        # Classification targets are class indices, not a horizon of values, so
+        # there is no prediction-vs-truth series to draw.
+        if exp_cfg.eval_config.task.task_type == "classification":
+            logger.info(
+                "[Plot] Skipping prediction plot: task_type='classification' has "
+                "class-label targets, not a forecast horizon to plot against."
+            )
+            return
         best_pt = run_dir / f"{run_name}__{best_kind}.pt"
         if best_pt.exists():
             plot_predictions_from_best(best_pt_path=best_pt, exp_cfg=exp_cfg, out_dir=plots_dir, split="test")
