@@ -102,10 +102,15 @@ def plot_evaluations_csv(eval_csv_path: Union[str, Path], out_dir: Union[str, Pa
     fig = plt.figure()
     if "fitness" in df.columns:
         plt.plot(df["eval_id"], df["fitness"], label="fitness", alpha=0.9)
-    if "result_mse" in df.columns:
-        plt.plot(df["eval_id"], df["result_mse"], label="result_mse", alpha=0.7)
-    if "best_mse" in df.columns:
-        plt.plot(df["eval_id"], df["best_mse"], label="best_mse", alpha=0.9)
+    # Column name is task-neutral; the metric it holds (mse or loss) is named per
+    # row in metric_name, so label the series with it.
+    metric_label = "metric"
+    if "metric_name" in df.columns and df["metric_name"].notna().any():
+        metric_label = str(df["metric_name"].dropna().iloc[0])
+    if "metric_value" in df.columns:
+        plt.plot(df["eval_id"], df["metric_value"], label=metric_label, alpha=0.7)
+    if "best_val_metric" in df.columns:
+        plt.plot(df["eval_id"], df["best_val_metric"], label=f"best_val_{metric_label}", alpha=0.9)
 
     plt.xlabel("eval_id")
     plt.ylabel("value")
