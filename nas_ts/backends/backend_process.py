@@ -10,7 +10,7 @@ from concurrent.futures import ProcessPoolExecutor, Future
 import torch
 from loguru import logger
 
-from .backend_base import EvaluationBackend
+from .backend_base import EvaluationBackend, failure_metrics
 from ..core.config import ExperimentConfig
 from ..evaluate.evaluate import evaluate_genome
 from ..utils.devices import validate_gpu_ids
@@ -97,12 +97,7 @@ def _process_worker(indiv_id: str, genome: Any) -> Tuple[str, Dict[str, float]]:
 
     except Exception as e:
         logger.exception(f"[Worker] crash indiv_id={indiv_id}")
-        return indiv_id, {
-            "mse": float("inf"),
-            "mae": float("inf"),
-            "params": float("inf"),
-            "worker_error": str(e),
-        }
+        return indiv_id, failure_metrics(_G_EXP_CFG, e)
 
 
 class ProcessBackend(EvaluationBackend):

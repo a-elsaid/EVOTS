@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, Future
 import torch
 from loguru import logger
 
-from .backend_base import EvaluationBackend
+from .backend_base import EvaluationBackend, failure_metrics
 from ..core.config import ExperimentConfig
 from ..evaluate.evaluate import evaluate_genome
 from ..utils.weight_pool import WeightPool
@@ -98,12 +98,7 @@ class ThreadedBackend(EvaluationBackend):
 
         except Exception as e:
             logger.exception(f"Worker({worker_id}) error in indiv {indiv_id}")
-            return indiv_id, {
-                "mse": float("inf"),
-                "mae": float("inf"),
-                "params": float("inf"),
-                "worker_error": str(e),
-            }
+            return indiv_id, failure_metrics(self.exp_cfg, e)
 
     def submit(self, indiv_id: str, genome: Any):
         if self._shutdown:
@@ -131,12 +126,7 @@ class ThreadedBackend(EvaluationBackend):
                 completed.append((indiv_id, metrics))
             except Exception as e:
                 logger.exception(f"[ThreadedBackend] Future failed for indiv_id={indiv_id}")
-                completed.append((indiv_id, {
-                    "mse": float("inf"),
-                    "mae": float("inf"),
-                    "params": float("inf"),
-                    "worker_error": str(e),
-                }))
+                completed.append((indiv_id, failure_metrics(self.exp_cfg, e)))
 
         return completed
 

@@ -1,6 +1,8 @@
 import yaml
 from typing import Optional
 
+from loguru import logger
+
 from .config import (
     RunInfo, TaskConfig, DatasetConfig, EvalConfig,
     SelectionConfig, SearchSpaceConfig,
@@ -74,7 +76,18 @@ def aggregate_classification_fitness(metrics: dict) -> float:
     # better" (tournament selection, early stopping, Pareto dominance). Using
     # loss (not raw accuracy) as fitness keeps that assumption true without
     # touching any of those comparison sites.
-    return metrics["loss"]
+    #
+    # A genome that failed to evaluate has no loss to report. Scoring it inf
+    # drops it from selection; raising here would abort the whole search over a
+    # single bad genome.
+    loss = (metrics or {}).get("loss")
+    if loss is None:
+        logger.warning(
+            f"[Fitness] Individual metrics carry no 'loss' key "
+            f"(keys={sorted((metrics or {}).keys())}); scoring it inf."
+        )
+        return float("inf")
+    return loss
 
 
 def build_experiment(cfg: dict) -> ExperimentConfig:
