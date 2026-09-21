@@ -66,6 +66,46 @@ def _json_safe_metrics(metrics: dict) -> dict:
 
     return out
 
+
+# The metric the search is actually optimising, per task type: aggregate_mse
+# uses metrics["mse"] for forecasting and aggregate_classification_fitness uses
+# metrics["loss"] for classification (see core/config_loader.py). Logging the
+# same key keeps the logged "best" identical to the fitness the engine selected
+# on. The two never co-occur in one metrics dict, so probing in order is
+# unambiguous.
+_PRIMARY_METRIC_KEYS = ("mse", "loss")
+
+
+def _primary_metric(metrics: dict):
+    """Return (key, value) for the optimised metric, or (None, None) if absent."""
+    for key in _PRIMARY_METRIC_KEYS:
+        value = (metrics or {}).get(key)
+        if value is not None:
+            return key, value
+    return None, None
+
+
+def _ensure_csv_header(path: Path, header: list) -> None:
+    """
+    Create the CSV with this header, or warn if an existing file has a different
+    one. Appending rows under a stale header would misalign every column, and a
+    misaligned CSV is indistinguishable from a correct one downstream.
+    """
+    if not path.exists():
+        with open(path, "w", newline="") as f:
+            csv.writer(f).writerow(header)
+        return
+
+    with open(path, "r", newline="") as f:
+        existing = next(csv.reader(f), [])
+    if existing and existing != header:
+        logger.warning(
+            f"[Logger] {path} has header {existing} but this run writes {header}. "
+            f"Rows appended now will not line up with the existing ones; move or "
+            f"delete the old file to get a clean CSV."
+        )
+
+
 class Logger:
     """
     Writes:
@@ -85,34 +125,35 @@ class Logger:
         self.gen_csv_path  = self.log_dir / f"{run_name}_generations.csv"
         self.json_path     = self.log_dir / f"{run_name}.jsonl"
 
-        if not self.eval_csv_path.exists():
-            with open(self.eval_csv_path, "w", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    "eval_id",
-                    "generation",
-                    "ind_id",
-                    "fitness",
-                    "result_mse",
-                    "best_mse",
-                    "loss",
-                    "mae",
-                    "params",
-                    "timestamp",
-                ])
+        # metric_name says which metric metric_value holds, so one schema serves
+        # both task types; accuracy and mae are the per-task extras and stay
+        # blank for the task that does not produce them.
+        self.eval_csv_header = [
+            "eval_id",
+            "generation",
+            "ind_id",
+            "fitness",
+            "metric_name",
+            "metric_value",
+            "best_val_metric",
+            "accuracy",
+            "mae",
+            "params",
+            "timestamp",
+        ]
+        self.gen_csv_header = [
+            "generation",
+            "best_fitness",
+            "avg_fitness",
+            "metric_name",
+            "best_metric",
+            "avg_metric",
+            "pop_size",
+            "timestamp",
+        ]
 
-        if not self.gen_csv_path.exists():
-            with open(self.gen_csv_path, "w", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    "generation",
-                    "best_fitness",
-                    "avg_fitness",
-                    "best_mse",
-                    "avg_mse",
-                    "pop_size",
-                    "timestamp",
-                ])
+        _ensure_csv_header(self.eval_csv_path, self.eval_csv_header)
+        _ensure_csv_header(self.gen_csv_path, self.gen_csv_header)
 
     def save_resolved_config(self, cfg: dict) -> Path:
         """
@@ -139,6 +180,35 @@ class Logger:
         metrics = ind.metrics or {}
 
         safe_metrics = _json_safe_metrics(metrics)
+        timestamp = datetime.now(timezone.utc).isoformat()
+
+        metric_name, metric_value = _primary_metric(safe_metrics)
+        if metric_name is None:
+            # Still record the row: the evaluation happened, and dropping it is
+            # how the evaluations CSV ends up empty with nothing to explain it.
+            logger.warning(
+                f"[Logger] Individual {ind.id} has none of {_PRIMARY_METRIC_KEYS} in its "
+                f"metrics (keys={sorted(safe_metrics)}). Logging the evaluation with an "
+                f"empty metric value."
+            )
+            best_val_metric = None
+        else:
+            best_val_metric = safe_metrics.get(f"best_val_{metric_name}")
+
+        with open(self.eval_csv_path, "a", newline="") as f:
+            csv.writer(f).writerow([
+                safe_metrics.get("eval_id", -1),
+                safe_metrics.get("generation", None),
+                ind.id,
+                ind.fitness,
+                metric_name,
+                metric_value,
+                best_val_metric,
+                safe_metrics.get("accuracy", None),
+                safe_metrics.get("mae", None),
+                safe_metrics.get("params", None),
+                timestamp,
+            ])
 
         with open(self.json_path, "a") as f:
             f.write(json.dumps({
@@ -147,10 +217,11 @@ class Logger:
                 "generation": safe_metrics.get("generation", None),
                 "ind_id": ind.id,
                 "fitness": ind.fitness,
-                "result_mse": safe_metrics.get("result_mse", None),
-                "best_mse": safe_metrics.get("best_mse", None),
+                "metric_name": metric_name,
+                "metric_value": metric_value,
+                "best_val_metric": best_val_metric,
                 "metrics": safe_metrics,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "timestamp": timestamp,
             }) + "\n")
 
     def log_generation(self, population, gen_number: int):
@@ -163,22 +234,52 @@ class Logger:
         else:
             best_fitness, avg_fitness = None, None
 
-        mse_inds = [ind for ind in inds if getattr(ind, "metrics", None) and ind.metrics.get("mse") is not None]
-        if mse_inds:
-            best_mse = min(ind.metrics["mse"] for ind in mse_inds)
-            avg_mse = sum(ind.metrics["mse"] for ind in mse_inds) / len(mse_inds)
+        # The whole population shares a task, so the first individual carrying a
+        # primary metric fixes the key the rest are aggregated on.
+        metric_name = None
+        for ind in inds:
+            metric_name, _ = _primary_metric(getattr(ind, "metrics", None) or {})
+            if metric_name is not None:
+                break
+
+        values, skipped = [], []
+        if metric_name is not None:
+            for ind in inds:
+                value = (getattr(ind, "metrics", None) or {}).get(metric_name)
+                if value is None:
+                    skipped.append(ind.id)
+                else:
+                    values.append(value)
+
+        if skipped:
+            logger.warning(
+                f"[Logger] Generation {gen_number}: {len(skipped)} individual(s) missing "
+                f"'{metric_name}' were left out of best/avg (ids={skipped})."
+            )
+
+        if values:
+            best_metric = min(values)
+            avg_metric = sum(values) / len(values)
         else:
-            best_mse, avg_mse = None, None
+            if inds:
+                logger.warning(
+                    f"[Logger] Generation {gen_number}: no individual reported any of "
+                    f"{_PRIMARY_METRIC_KEYS}; best/avg metric left empty."
+                )
+            best_metric, avg_metric = None, None
+
+        timestamp = datetime.now(timezone.utc).isoformat()
 
         with open(self.gen_csv_path, "a", newline="") as f:
             csv.writer(f).writerow([
                 gen_number,
                 best_fitness,
                 avg_fitness,
-                best_mse,
-                avg_mse,
+                metric_name,
+                best_metric,
+                avg_metric,
                 population.size(),
-                datetime.now(timezone.utc).isoformat()
+                timestamp,
             ])
 
         with open(self.json_path, "a") as f:
@@ -187,8 +288,9 @@ class Logger:
                 "generation": gen_number,
                 "best_fitness": best_fitness,
                 "avg_fitness": avg_fitness,
-                "best_mse": best_mse,
-                "avg_mse": avg_mse,
+                "metric_name": metric_name,
+                "best_metric": best_metric,
+                "avg_metric": avg_metric,
                 "pop_size": population.size(),
-                "timestamp": datetime.now(timezone.utc).isoformat()
+                "timestamp": timestamp,
             }) + "\n")
