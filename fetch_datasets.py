@@ -2,10 +2,13 @@
 Run from the EVOTS repo root: python fetch_datasets.py
 Requires: pip install scikit-learn (if not already installed)
 """
+from pathlib import Path
+
 import pandas as pd
 from sklearn.datasets import load_iris, load_wine, load_breast_cancer
 
 OUT = "data/tabular"
+Path(OUT).mkdir(parents=True, exist_ok=True)
 
 def save_sklearn(loader, name):
     d = loader()
