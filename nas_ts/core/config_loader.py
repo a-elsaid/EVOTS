@@ -114,6 +114,7 @@ def build_experiment(cfg: dict) -> ExperimentConfig:
             num_workers=tab_cfg.get("num_workers", 0),
             normalize=tab_cfg.get("normalize", True),
             random_seed=tab_cfg.get("random_seed", 42),
+            split_mode=tab_cfg.get("split_mode", "clean"),
         )
         ds_cfg = DatasetConfig(
             name="Tabular",
