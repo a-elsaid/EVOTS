@@ -125,7 +125,7 @@ def ensure_datasets(datasets) -> None:
         return
 
     print(f"[Suite] Missing dataset CSVs: {', '.join(missing)}. Running {FETCH_SCRIPT.name} ...")
-    DATA_DIR.mkdir(parents=True, exist_ok=True)  # fetch_datasets.py does not create it
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     try:
         proc = subprocess.run(
             [sys.executable, str(FETCH_SCRIPT)],
