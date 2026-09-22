@@ -10,6 +10,8 @@ os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 
 import sys
+import time
+import traceback
 import yaml
 import multiprocessing as mp
 from pathlib import Path
@@ -27,6 +29,9 @@ from nas_ts.utils.weight_pool import WeightPool
 from nas_ts.utils.model_package import ModelPackage
 from nas_ts.utils.devices import auto_detect_device
 from nas_ts.utils.seeding import seed_everything
+from nas_ts.utils.run_results import (
+    RESULTS_FILENAME, STATUS_FAILED, STATUS_OK, build_results, write_results_json,
+)
 
 
 def print_config_summary(cfg: dict):
@@ -83,6 +88,34 @@ def main():
     seed_everything(cfg["evo"]["random_seed"], where="Main")
 
     logger.info(f"Starting NAS experiment: {run_name}\n")
+
+    # Everything from here is guarded so a crash still leaves a results.json.
+    # A missing file then means "never ran"; status "failed" means "ran and
+    # broke". The suite runner needs to tell those apart to resume correctly.
+    started = time.perf_counter()
+    is_classification = (cfg.get("task", {}) or {}).get("task_type") == "classification"
+    results_path = run_dir / RESULTS_FILENAME
+    try:
+        _search_and_report(args, cfg, exp_logger_args=(run_dir, run_name),
+                           results_path=results_path, started=started,
+                           is_classification=is_classification)
+    except Exception as e:
+        if is_classification:
+            write_results_json(results_path, build_results(
+                status=STATUS_FAILED,
+                run_name=run_name,
+                config_path=args.config,
+                cfg=cfg,
+                wall_clock_seconds=time.perf_counter() - started,
+                error=f"{type(e).__name__}: {e}",
+                repo_dir=str(Path(__file__).resolve().parent.parent),
+            ))
+            logger.error(f"[Results] Run failed; wrote {results_path} with status=failed")
+        raise
+
+
+def _search_and_report(args, cfg, exp_logger_args, results_path, started, is_classification):
+    run_dir, run_name = exp_logger_args
 
     exp_cfg = build_experiment(cfg)
     exp_logger = Logger(log_dir=str(run_dir), run_name=run_name)
@@ -176,6 +209,24 @@ def main():
     )
     best_indiv.genome.dump_structure(run_dir / f"{run_name}__best_finetuned.genome.json")
     logger.info(f"[Final] test_metrics={test_metrics}")
+
+    if is_classification:
+        # params is the search-time count for this genome; the finetuned model is
+        # the same architecture, so it is the best model's parameter count.
+        write_results_json(results_path, build_results(
+            status=STATUS_OK,
+            run_name=run_name,
+            config_path=args.config,
+            cfg=cfg,
+            wall_clock_seconds=time.perf_counter() - started,
+            meta=meta,
+            test_metrics=test_metrics,
+            best_genome=best_indiv.genome.to_dict(),
+            best_params=(best_indiv.metrics or {}).get("params"),
+            n_evaluated=engine.eval_count,
+            repo_dir=str(Path(__file__).resolve().parent.parent),
+        ))
+        logger.info(f"[Results] Wrote {results_path}")
 
     # Plotting is a reporting step after every metric is already written; a
     # failure here must not take down a completed run.

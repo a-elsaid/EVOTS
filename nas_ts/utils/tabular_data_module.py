@@ -218,6 +218,9 @@ def make_tabular_dataloaders(cfg: TabularDataConfig):
         "n_test": int(len(test_ds)),
         "normalize": bool(cfg.normalize),
         "split_mode": split_mode,
+        # The seed the split actually used, so a results record never has to
+        # guess it from a config that may have left it defaulted.
+        "random_seed": int(cfg.random_seed),
         "scaling": scaling["scaling"],
         # True when the test split IS the validation split, so any consumer of
         # these results can see that the test number is not held out.
