@@ -1,6 +1,24 @@
 import torch
 from typing import Optional
 
+from loguru import logger
+
+# Warn once per process: auto_detect_device is called for every evaluation and
+# in every worker, and repeating this on each call would bury the run log.
+_MPS_WARNED = False
+
+
+def _warn_mps_once() -> None:
+    global _MPS_WARNED
+    if _MPS_WARNED:
+        return
+    _MPS_WARNED = True
+    logger.warning(
+        "[Device] Resolved to 'mps'. MPS is untested with the process backend: "
+        "under torch 2.0.1 the spawned worker dies with BrokenProcessPool and no "
+        "Python traceback. Set eval.device=cpu if the search fails to start."
+    )
+
 
 def validate_gpu_ids(gpu_ids: list[int]) -> list[int]:
     """
@@ -49,6 +67,7 @@ def auto_detect_device(preferred: Optional[str] = "auto") -> str:
             # respect torch.cuda.set_device(...) already done in this process
             return f"cuda:{torch.cuda.current_device()}"
         if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            _warn_mps_once()
             return "mps"
         return "cpu"
 
@@ -56,5 +75,8 @@ def auto_detect_device(preferred: Optional[str] = "auto") -> str:
         if not torch.cuda.is_available():
             return "cpu"
         return f"cuda:{torch.cuda.current_device()}"
+
+    if preferred == "mps":
+        _warn_mps_once()
 
     return preferred
