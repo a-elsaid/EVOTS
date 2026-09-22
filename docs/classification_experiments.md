@@ -15,11 +15,17 @@ Everything is one command, resumable, and designed to be left alone overnight.
 git clone <repo> && cd EVOTS
 git checkout feature/tabular-classification
 
-python3 -m venv .venv
+python3.11 -m venv .venv
+# or, with uv:  uv venv --python 3.11 .venv
 source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
+
+**Use Python 3.11, not whatever `python3` points at.** `torch==2.0.1` publishes no
+wheels for anything newer, and `PyYAML==6.0.x` has no 3.13 wheel and fails to build
+from source against current setuptools. On 3.13 the install dies partway through
+with a Cython error that does not mention the Python version.
 
 One thing about dependencies: **`requirements.txt` pins `tensorflow` and
 `tensorcircuit`.** Those are only needed for the quantum work. If they fail to
@@ -29,6 +35,7 @@ nothing in this document imports them.
 Check the install:
 
 ```bash
+pip install pytest        # test-only, not in requirements.txt
 PYTHONPATH=$PWD python -m pytest tests/ -q --ignore=tests/test_weight_transfer.py
 ```
 
@@ -251,11 +258,21 @@ The suite runs two split protocols:
 | `exaqc` | stratified 80/20 | MinMax x pi, fitted on the **full** dataset | **same samples as validation** |
 
 `exaqc` reproduces EXAQC's published protocol so the comparison is like-for-like.
-In that mode the reported test accuracy is a **fitted number, not a generalisation
-estimate**: model selection and early stopping run on the very samples being
-reported, and the scaler saw the holdout's range before training. It is
-optimistically biased — for EvoTS, for the baselines and for EXAQC's own published
-figures alike.
+In that mode the reported test accuracy is **not a generalisation estimate**, but
+the two systems are compromised to different degrees:
+
+- **EvoTS** is affected by both problems. Its search selects architectures, and its
+  early stopping selects weights, on the very samples it then reports — and the
+  scaler saw those samples' range before training. Its `exaqc` numbers are fitted,
+  not held out.
+- **The classical baselines** are affected only by the scaler. They do no
+  hyperparameter selection at all in this mode, precisely because validation is the
+  test set; each uses its default hyperparameters. Their `exaqc` numbers are
+  conservative relative to EvoTS's, which is why the comparison table marks them
+  `[no tuning]`.
+
+EXAQC's own published figures carry the same selection problem EvoTS does, since
+their search selects on that holdout too.
 
 Use `exaqc` numbers only when comparing against their Table 1. Use `clean` numbers
 for any claim about how well the model actually generalises. The comparison table

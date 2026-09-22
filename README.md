@@ -4,7 +4,7 @@ EvoTS is an evolutionary neural architecture search framework for discovering ta
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.11 (torch 2.0.1 has no wheels for newer versions)
 - PyTorch 2.0+
 - pandas, numpy, matplotlib, loguru, rich, pyyaml
 
