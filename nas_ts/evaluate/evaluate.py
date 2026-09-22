@@ -106,6 +106,38 @@ def classification_loss_sum(logits: torch.Tensor, y: torch.Tensor) -> float:
     return F.cross_entropy(logits, y, reduction="sum").item()
 
 
+def classification_class_counts(logits: torch.Tensor, y: torch.Tensor, num_classes: int):
+    """
+    Per-class (correct, total) counts for this batch, as tensors of length
+    num_classes. Accumulated across the whole split, they give macro accuracy
+    the same sample weighting as plain accuracy.
+    """
+    preds = logits.argmax(dim=-1).detach().cpu()
+    target = y.detach().cpu()
+    total = torch.bincount(target, minlength=num_classes)[:num_classes]
+    correct = torch.bincount(target[preds == target], minlength=num_classes)[:num_classes]
+    return correct, total
+
+
+def macro_accuracy(correct, total) -> float:
+    """
+    Mean-class accuracy: accuracy per class, then averaged over classes.
+
+    Classes with no sample in this split are skipped rather than counted as
+    zero, and the denominator is the number of classes actually present. A class
+    absent from a split says nothing about the model, and scoring it 0 would drag
+    the mean down for a reason that belongs to the split, not the classifier.
+    With stratified splits every class is present and this choice never binds.
+
+    Reported only: this must never feed fitness or early stopping, which stay on
+    cross-entropy loss.
+    """
+    per_class = [c / t for c, t in zip(correct.tolist(), total.tolist()) if t > 0]
+    if not per_class:
+        return 0.0
+    return float(sum(per_class) / len(per_class))
+
+
 def _get_optimizer(model: nn.Module, eval_cfg: EvalConfig):
     opt_name = eval_cfg.optimizer.lower()
     kwargs = eval_cfg.optimizer_kwargs.copy()
@@ -285,6 +317,9 @@ def _train_and_eval_on_dataset(
     cls_loss_total = 0.0
     cls_correct = 0
     cls_n = 0
+    num_classes = int(meta.get("num_classes") or 0)
+    cls_class_correct = torch.zeros(num_classes, dtype=torch.long)
+    cls_class_total = torch.zeros(num_classes, dtype=torch.long)
 
     latency = None
     measured_latency = False
@@ -314,6 +349,10 @@ def _train_and_eval_on_dataset(
                 cls_loss_total += classification_loss_sum(y_hat, y)
                 cls_correct += classification_correct(y_hat, y)
                 cls_n += int(y.size(0))
+                if num_classes:
+                    bc, bt = classification_class_counts(y_hat, y, num_classes)
+                    cls_class_correct += bc
+                    cls_class_total += bt
             else:
                 mse_vals.append(mse_loss(y_hat, y))
                 mae_vals.append(mae_loss(y_hat, y))
@@ -326,6 +365,7 @@ def _train_and_eval_on_dataset(
         metrics = {
             "loss": loss_mean,
             "accuracy": acc_mean,
+            "macro_accuracy": macro_accuracy(cls_class_correct, cls_class_total),
             "params": float(params),
         }
     else:
@@ -555,6 +595,9 @@ def finetune_and_test(
     model.eval()
     mse_vals, mae_vals = [], []
     test_cls_loss_total, test_cls_correct, test_cls_n = 0.0, 0, 0
+    test_num_classes = int(meta.get("num_classes") or 0)
+    test_class_correct = torch.zeros(test_num_classes, dtype=torch.long)
+    test_class_total = torch.zeros(test_num_classes, dtype=torch.long)
 
     with torch.no_grad():
         for batch in test_loader:
@@ -565,6 +608,10 @@ def finetune_and_test(
                 test_cls_loss_total += classification_loss_sum(y_hat, y)
                 test_cls_correct += classification_correct(y_hat, y)
                 test_cls_n += int(y.size(0))
+                if test_num_classes:
+                    bc, bt = classification_class_counts(y_hat, y, test_num_classes)
+                    test_class_correct += bc
+                    test_class_total += bt
             else:
                 y_hat, y = _align_pred_target(y_hat, y)
                 mse_vals.append(mse_crit(y_hat, y).item())
@@ -573,13 +620,16 @@ def finetune_and_test(
     if is_classification:
         test_loss = float(test_cls_loss_total / test_cls_n) if test_cls_n else float("inf")
         test_acc = float(test_cls_correct / test_cls_n) if test_cls_n else 0.0
+        test_macro_acc = macro_accuracy(test_class_correct, test_class_total)
         logger.info(
             f"[Finetune] TEST results | "
-            f"loss={test_loss:.6f} | accuracy={test_acc:.4f}"
+            f"loss={test_loss:.6f} | accuracy={test_acc:.4f} | "
+            f"macro_accuracy={test_macro_acc:.4f}"
         )
         test_metrics = {
             "test_loss": test_loss,
             "test_accuracy": test_acc,
+            "test_macro_accuracy": test_macro_acc,
             "best_val_loss": best_val_mse,
             "finetune_steps_run": step,
         }
