@@ -239,11 +239,13 @@ def write_markdown(rows, path: Path, problems):
         "**Reading this table.** Only `exaqc` rows are comparable with the "
         "published EXAQC column: that mode reproduces their protocol "
         "(stratified 80/20, the same 20% used as both validation and test, "
-        "MinMax×π scaling fitted on the full dataset). Those numbers are "
-        "optimistically biased by construction, for every system in the row. "
-        "`clean` rows use a stricter protocol (70/15/15, scaler fitted on train "
-        "only, test evaluated once) and are **not** comparable to EXAQC's "
-        "published figures.",
+        "MinMax×π scaling fitted on the full dataset). No `exaqc` number is a "
+        "held-out estimate, but the systems are compromised to different "
+        "degrees: EvoTS (and EXAQC) also *select* on the reported samples, "
+        "through architecture search and early stopping, while the baselines "
+        "only inherit the full-dataset scaler. `clean` rows use a stricter "
+        "protocol (70/15/15, scaler fitted on train only, test evaluated once) "
+        "and are **not** comparable to EXAQC's published figures.",
         "",
         "EvoTS rows are split by condition (`classical`, `quantum`, ...); a run "
         "with no condition recorded is counted as `classical` and listed under "
