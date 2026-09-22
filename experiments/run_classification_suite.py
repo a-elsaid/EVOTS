@@ -41,6 +41,32 @@ ALL_SPLIT_MODES = ["clean", "exaqc"]
 DEFAULT_SEEDS = list(range(10))
 
 CONFIG_DIR = REPO_ROOT / "configs" / "classification"
+
+# EvoTS will be run in more than one condition (classical now, quantum later).
+# The condition is part of the run name, so a quantum sweep never mistakes a
+# classical run's results.json for its own and skips work it has not done.
+DEFAULT_CONDITION = "classical"
+
+# Condition labels become row keys in the comparison table, so "Quantum" and
+# "quantum" would silently split one condition across two rows, each with half
+# the seeds. Normalise and reject anything that would not round-trip.
+CONDITION_RE = re.compile(r"^[a-z0-9-]+$")
+
+
+def normalise_condition(condition: str) -> str:
+    """Lowercase the label, or exit with a message naming what is allowed."""
+    normalised = str(condition).strip().lower()
+    if not CONDITION_RE.match(normalised):
+        print(
+            f"[Suite] STOPPING: --condition {condition!r} is not a valid label. "
+            f"Use lowercase letters, digits and hyphens only (e.g. 'classical', "
+            f"'quantum', 'quantum-v2'). The label becomes part of every run name "
+            f"and of the row key in the comparison table, so anything else would "
+            f"split one condition across several rows.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return normalised
 DATA_DIR = REPO_ROOT / "data" / "tabular"
 FETCH_SCRIPT = REPO_ROOT / "fetch_datasets.py"
 
@@ -48,7 +74,7 @@ FETCH_SCRIPT = REPO_ROOT / "fetch_datasets.py"
 # identity of the sweep (two runs writing to one directory, or a seed that does
 # not match its name), so they are applied last and a collision is called out.
 OWNED_KEYS = {
-    "run.name", "run.logs_dir", "run.checkpoints_dir",
+    "run.name", "run.logs_dir", "run.checkpoints_dir", "run.condition",
     "evo.random_seed", "data.tabular.random_seed", "data.tabular.split_mode",
 }
 
@@ -90,8 +116,8 @@ def archive_previous_attempt(rdir: Path):
     return dest
 
 
-def run_name(dataset: str, split_mode: str, seed: int) -> str:
-    return f"{dataset}_{split_mode}_seed{seed}"
+def run_name(condition: str, dataset: str, split_mode: str, seed: int) -> str:
+    return f"{condition}_{dataset}_{split_mode}_seed{seed}"
 
 
 def run_dir(out_dir: Path, name: str) -> Path:
@@ -157,9 +183,10 @@ def ensure_datasets(datasets) -> None:
 
 
 def build_command(dataset: str, split_mode: str, seed: int, out_dir: Path,
-                  user_sets) -> list:
-    config = CONFIG_DIR / f"{dataset}.yml"
-    name = run_name(dataset, split_mode, seed)
+                  user_sets, condition: str = DEFAULT_CONDITION,
+                  config_dir: Path = CONFIG_DIR) -> list:
+    config = Path(config_dir) / f"{dataset}.yml"
+    name = run_name(condition, dataset, split_mode, seed)
 
     cmd = [sys.executable, str(REPO_ROOT / "experiments" / "run_exp.py"),
            "--config", str(config)]
@@ -173,6 +200,8 @@ def build_command(dataset: str, split_mode: str, seed: int, out_dir: Path,
         # Per run: the config's shared checkpoints/ would have every run writing
         # ckpt_*.pt over every other run's.
         f"run.checkpoints_dir={run_dir(out_dir, name) / 'checkpoints'}",
+        # Recorded in results.json so the aggregation can separate conditions.
+        f"run.condition={condition}",
         f"evo.random_seed={seed}",
         f"data.tabular.random_seed={seed}",
         f"data.tabular.split_mode={split_mode}",
@@ -182,18 +211,21 @@ def build_command(dataset: str, split_mode: str, seed: int, out_dir: Path,
 
 
 def record_crash(out_dir: Path, dataset: str, split_mode: str, seed: int,
-                 returncode, log_path: Path, elapsed: float) -> None:
+                 returncode, log_path: Path, elapsed: float,
+                 condition: str = DEFAULT_CONDITION,
+                 config_dir: Path = CONFIG_DIR) -> None:
     """
     Write a failed results.json for a run that died without writing one.
 
     Without this a natively-killed run is indistinguishable from one that never
     started, and the aggregation step would silently omit it.
     """
-    name = run_name(dataset, split_mode, seed)
+    name = run_name(condition, dataset, split_mode, seed)
     write_results_json(results_file(out_dir, name), {
         "status": STATUS_FAILED,
         "run_name": name,
-        "config_path": str(CONFIG_DIR / f"{dataset}.yml"),
+        "condition": condition,
+        "config_path": str(Path(config_dir) / f"{dataset}.yml"),
         "task_type": "classification",
         "dataset_path": str(DATA_DIR / f"{dataset}.csv"),
         "split_mode": split_mode,
@@ -217,6 +249,11 @@ def parse_args(argv=None):
                    choices=ALL_SPLIT_MODES)
     p.add_argument("--out-dir", default="logs/classification",
                    help="where each run's directory and results.json are written")
+    p.add_argument("--config-dir", default=str(CONFIG_DIR),
+                   help="directory holding <dataset>.yml for this condition")
+    p.add_argument("--condition", default=DEFAULT_CONDITION,
+                   help="EvoTS condition label; part of every run name, so "
+                        "sweeps of different conditions never collide")
     p.add_argument("--set", action="append", dest="sets", default=[],
                    metavar="key.path=value",
                    help="passed through to run_exp; repeatable")
@@ -232,6 +269,19 @@ def parse_args(argv=None):
 def main(argv=None) -> int:
     args = parse_args(argv)
     out_dir = Path(args.out_dir)
+    config_dir = Path(args.config_dir)
+    condition = normalise_condition(args.condition)
+    if condition != args.condition:
+        print(f"[Suite] NOTE: condition {args.condition!r} normalised to "
+              f"{condition!r}.")
+
+    missing_configs = [d for d in args.datasets
+                       if not (config_dir / f"{d}.yml").exists()]
+    if missing_configs:
+        print(f"[Suite] STOPPING: no config for {', '.join(missing_configs)} in "
+              f"{config_dir.resolve()}. A condition needs one <dataset>.yml per "
+              f"dataset it sweeps.", file=sys.stderr)
+        return 2
 
     clobbered = sorted(k for k in OWNED_KEYS
                        if any(s.split("=", 1)[0].strip() == k for s in args.sets))
@@ -244,13 +294,15 @@ def main(argv=None) -> int:
             for m in args.split_modes
             for s in args.seeds]
 
-    print(f"[Suite] {len(plan)} runs: {len(args.datasets)} datasets x "
-          f"{len(args.split_modes)} split modes x {len(args.seeds)} seeds")
+    print(f"[Suite] {len(plan)} runs: condition={condition}, "
+          f"{len(args.datasets)} datasets x {len(args.split_modes)} split modes "
+          f"x {len(args.seeds)} seeds")
+    print(f"[Suite] Configs: {config_dir.resolve()}")
     print(f"[Suite] Output: {out_dir.resolve()}")
 
     if args.dry_run:
         for d, m, s in plan:
-            name = run_name(d, m, s)
+            name = run_name(condition, d, m, s)
             state = "skip (ok)" if (not args.force and already_ok(results_file(out_dir, name))) else "run"
             print(f"    {name:44s} {state}")
         return 0
@@ -262,7 +314,7 @@ def main(argv=None) -> int:
     suite_started = time.perf_counter()
 
     for i, (dataset, split_mode, seed) in enumerate(plan, start=1):
-        name = run_name(dataset, split_mode, seed)
+        name = run_name(condition, dataset, split_mode, seed)
         rpath = results_file(out_dir, name)
 
         if not args.force and already_ok(rpath):
@@ -277,7 +329,8 @@ def main(argv=None) -> int:
         rdir.mkdir(parents=True, exist_ok=True)
         log_path = rdir / "suite_run.log"
 
-        cmd = build_command(dataset, split_mode, seed, out_dir, args.sets)
+        cmd = build_command(dataset, split_mode, seed, out_dir, args.sets,
+                            condition=condition, config_dir=config_dir)
         print(f"[{i}/{len(plan)}] {name}: running -> {log_path}")
 
         started = time.perf_counter()
@@ -303,7 +356,9 @@ def main(argv=None) -> int:
             print(f"    ok in {elapsed:.1f}s")
         else:
             if not rpath.exists():
-                record_crash(out_dir, dataset, split_mode, seed, returncode, log_path, elapsed)
+                record_crash(out_dir, dataset, split_mode, seed, returncode,
+                             log_path, elapsed, condition=condition,
+                             config_dir=config_dir)
             failed.append((name, str(log_path)))
             print(f"    FAILED (exit={returncode}) after {elapsed:.1f}s")
 
