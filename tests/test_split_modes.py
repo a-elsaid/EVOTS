@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 import torch
 
+from conftest import require_tabular
 from nas_ts.utils import tabular_data_module as tdm
 from nas_ts.utils.tabular_data_module import (
     EXAQC_FEATURE_SCALE,
@@ -53,6 +54,7 @@ def _reset_warn():
 
 @pytest.mark.parametrize("name", sorted(DATASETS))
 def test_clean_split_sizes_are_70_15_15(name):
+    require_tabular(name)
     path, n, _ = DATASETS[name]
     _, _, _, meta = make_tabular_dataloaders(
         _cfg(path, train_ratio=0.7, val_ratio=0.15, split_mode="clean"))
@@ -82,6 +84,7 @@ def _source_duplicate_rows(path):
 
 @pytest.mark.parametrize("name", sorted(DATASETS))
 def test_clean_splits_do_not_overlap(name):
+    require_tabular(name)
     path, n, _ = DATASETS[name]
     tr, va, te, _ = make_tabular_dataloaders(
         _cfg(path, train_ratio=0.7, val_ratio=0.15, split_mode="clean", normalize=False))
@@ -108,6 +111,7 @@ def test_clean_split_is_stratified(name):
     Each split must mirror the WHOLE dataset's class proportions -- not be
     balanced. Breast cancer is 37/63, so a balance assertion would be wrong.
     """
+    require_tabular(name)
     path, n, k = DATASETS[name]
     tr, va, te, meta = make_tabular_dataloaders(
         _cfg(path, train_ratio=0.7, val_ratio=0.15, split_mode="clean"))
@@ -124,6 +128,7 @@ def test_clean_split_is_stratified(name):
 
 
 def test_clean_scaler_is_fitted_on_train_only():
+    require_tabular("iris")
     """Train is standardised to ~zero mean; val/test are not, since they were
     transformed with train's statistics."""
     tr, va, _, _ = make_tabular_dataloaders(
@@ -138,6 +143,7 @@ def test_clean_scaler_is_fitted_on_train_only():
 
 @pytest.mark.parametrize("name", sorted(DATASETS))
 def test_exaqc_split_is_80_20(name):
+    require_tabular(name)
     path, n, _ = DATASETS[name]
     _, _, _, meta = make_tabular_dataloaders(_cfg(path, split_mode="exaqc"))
 
@@ -150,6 +156,7 @@ def test_exaqc_split_is_80_20(name):
 
 @pytest.mark.parametrize("name", sorted(DATASETS))
 def test_exaqc_val_and_test_are_identical(name):
+    require_tabular(name)
     path, _, _ = DATASETS[name]
     _, va, te, meta = make_tabular_dataloaders(_cfg(path, split_mode="exaqc"))
 
@@ -162,6 +169,7 @@ def test_exaqc_val_and_test_are_identical(name):
 
 @pytest.mark.parametrize("name", sorted(DATASETS))
 def test_exaqc_features_are_scaled_to_zero_pi(name):
+    require_tabular(name)
     path, _, _ = DATASETS[name]
     tr, _, te, meta = make_tabular_dataloaders(_cfg(path, split_mode="exaqc"))
 
@@ -178,6 +186,7 @@ def test_exaqc_features_are_scaled_to_zero_pi(name):
 
 @pytest.mark.parametrize("name", sorted(DATASETS))
 def test_exaqc_split_is_stratified(name):
+    require_tabular(name)
     path, _, k = DATASETS[name]
     tr, _, te, _ = make_tabular_dataloaders(_cfg(path, split_mode="exaqc"))
     overall = _dataset_proportions(path, k)
@@ -190,6 +199,7 @@ def test_exaqc_split_is_stratified(name):
 
 
 def test_exaqc_warns_about_val_being_test(caplog):
+    require_tabular("iris")
     seen = []
     from loguru import logger
     sink = logger.add(lambda m: seen.append(str(m)), level="WARNING")
@@ -207,17 +217,21 @@ def test_exaqc_warns_about_val_being_test(caplog):
 # ---------------------------------------------------------------- misc
 
 def test_unknown_split_mode_raises():
+    require_tabular("iris")
     with pytest.raises(ValueError, match="split_mode"):
         make_tabular_dataloaders(_cfg(DATASETS["iris"][0], split_mode="holdout"))
 
 
 def test_default_split_mode_is_clean():
+    # The dataclass default needs no data; the loader half does.
     assert TabularDataConfig(path="x").split_mode == "clean"
+    require_tabular("iris")
     _, _, _, meta = make_tabular_dataloaders(_cfg(DATASETS["iris"][0]))
     assert meta["split_mode"] == "clean"
 
 
 def test_same_seed_gives_same_split():
+    require_tabular("iris")
     a = make_tabular_dataloaders(_cfg(DATASETS["iris"][0], random_seed=3))[2]
     b = make_tabular_dataloaders(_cfg(DATASETS["iris"][0], random_seed=3))[2]
     c = make_tabular_dataloaders(_cfg(DATASETS["iris"][0], random_seed=4))[2]
