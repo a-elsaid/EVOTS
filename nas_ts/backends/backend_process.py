@@ -16,6 +16,7 @@ from ..evaluate.evaluate import evaluate_genome
 from ..utils.devices import validate_gpu_ids
 from ..utils.logger import setup_logging
 from ..utils.model_package import ModelPackage
+from ..utils.seeding import derive_task_seed, seed_everything
 
 
 _G_EXP_CFG: Optional[ExperimentConfig] = None
@@ -59,6 +60,19 @@ def _init_process(exp_cfg: ExperimentConfig, gpu_id: Optional[int]):
 
 
 def _process_worker(indiv_id: str, genome: Any) -> Tuple[str, Dict[str, float]]:
+    # Seed from the individual's ID, not from this worker's identity, so a genome
+    # trains identically whichever worker happens to pick it up. Per-genome
+    # results therefore reproduce at any worker count. A whole run reproduces
+    # only at num_workers=1: the search is asynchronous and steady-state, so
+    # completion order decides which parents are available when a child is bred,
+    # and the architectures explored diverge between runs regardless of seeding.
+    base_seed = getattr(getattr(_G_EXP_CFG, "evolution", None), "random_seed", None)
+    if base_seed is not None:
+        seed_everything(
+            derive_task_seed(base_seed, indiv_id),
+            where=f"Task[indiv={indiv_id}] PID={os.getpid()}",
+        )
+
     try:
         out = evaluate_genome(
             genome,

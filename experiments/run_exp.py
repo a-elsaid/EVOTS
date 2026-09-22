@@ -26,6 +26,7 @@ from nas_ts.utils.plot_results import plot_run
 from nas_ts.utils.weight_pool import WeightPool
 from nas_ts.utils.model_package import ModelPackage
 from nas_ts.utils.devices import auto_detect_device
+from nas_ts.utils.seeding import seed_everything
 
 
 def print_config_summary(cfg: dict):
@@ -75,6 +76,12 @@ def main():
 
     setup_logging(str(run_dir))
     print_config_summary(cfg)
+
+    # Seed before anything draws a random number: genome init, mutation and
+    # crossover all run in this process, so this fixes which architectures the
+    # search explores.
+    seed_everything(cfg["evo"]["random_seed"], where="Main")
+
     logger.info(f"Starting NAS experiment: {run_name}\n")
 
     exp_cfg = build_experiment(cfg)
