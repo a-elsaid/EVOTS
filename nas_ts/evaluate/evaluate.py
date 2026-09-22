@@ -119,6 +119,26 @@ def classification_class_counts(logits: torch.Tensor, y: torch.Tensor, num_class
     return correct, total
 
 
+def _resolve_num_classes(meta, is_classification: bool, where: str) -> int:
+    """
+    Class count for the per-class tallies, or 0 when it cannot be determined.
+
+    At 0 the tallies are skipped and macro_accuracy comes back nan, which reads as
+    "not measured" instead of as a plausible score. Warn as well, so the reason is
+    in the log and not only in the blank cell.
+    """
+    if not is_classification:
+        return 0
+    n = int((meta or {}).get("num_classes") or 0)
+    if n == 0:
+        logger.warning(
+            f"[{where}] meta is missing 'num_classes' (keys={sorted((meta or {}).keys())}); "
+            f"per-class tallies are skipped and macro_accuracy will be reported as nan, "
+            f"not measured. Plain accuracy and loss are unaffected."
+        )
+    return n
+
+
 def macro_accuracy(correct, total) -> float:
     """
     Mean-class accuracy: accuracy per class, then averaged over classes.
@@ -131,10 +151,15 @@ def macro_accuracy(correct, total) -> float:
 
     Reported only: this must never feed fitness or early stopping, which stay on
     cross-entropy loss.
+
+    With no class present at all -- an empty split, or a meta without
+    'num_classes' -- there is nothing to average, so the result is nan rather
+    than 0.0. nan propagates through the cross-dataset averaging and renders as a
+    blank cell, where 0.0 would read as a model that got every class wrong.
     """
     per_class = [c / t for c, t in zip(correct.tolist(), total.tolist()) if t > 0]
     if not per_class:
-        return 0.0
+        return float("nan")
     return float(sum(per_class) / len(per_class))
 
 
@@ -180,6 +205,9 @@ def _train_and_eval_on_dataset(
     task = eval_cfg.task
     device = auto_detect_device(eval_cfg.device)
     is_classification = (task.task_type == "classification")
+    # Log wording only: the value under these names is cross-entropy for
+    # classification and MSE for forecasting. Variable names are left alone.
+    best_val_label = "best_val_loss" if is_classification else "best_val_mse"
 
     ds_cfg = eval_cfg.datasets[ds_index]
 
@@ -297,7 +325,7 @@ def _train_and_eval_on_dataset(
             if bad_checks >= early_stop_patience:
                 logger.info(
                     f"[EarlyStop] epoch={epoch+1}, "
-                    f"best_val_mse={best_val:.6f}"
+                    f"{best_val_label}={best_val:.6f}"
                 )
                 break
         
@@ -317,7 +345,7 @@ def _train_and_eval_on_dataset(
     cls_loss_total = 0.0
     cls_correct = 0
     cls_n = 0
-    num_classes = int(meta.get("num_classes") or 0)
+    num_classes = _resolve_num_classes(meta, is_classification, "Eval")
     cls_class_correct = torch.zeros(num_classes, dtype=torch.long)
     cls_class_total = torch.zeros(num_classes, dtype=torch.long)
 
@@ -443,6 +471,11 @@ def finetune_and_test(
     task = eval_cfg.task
     device = auto_detect_device(eval_cfg.device)
     is_classification = (task.task_type == "classification")
+    # Log wording only: val_mse holds cross-entropy on classification runs, and
+    # calling it "val_mse" in the log misleads anyone reading it. The variables
+    # keep their names so the diff stays to the logged strings.
+    val_label = "val_loss" if is_classification else "val_mse"
+    best_val_label = "best_val_loss" if is_classification else "best_val_mse"
 
 
     can_early_stop = eval_cfg.early_stopping
@@ -540,7 +573,7 @@ def finetune_and_test(
 
             logger.info(
                 f"[Finetune] Step {step:5d} | "
-                f"val_mse improved → {best_val_mse:.6f}"
+                f"{val_label} improved → {best_val_mse:.6f}"
             )
         else:
             # Not an improvement. This must decrement patience whether val_mse is
@@ -554,14 +587,14 @@ def finetune_and_test(
                 worse_than, reference = "current best", best_val_mse
             logger.debug(
                 f"[Finetune] Step {step:5d}/{extra_training_steps} | "
-                f"val_mse={val_mse:.6f} did not improve (worse than {worse_than}: "
+                f"{val_label}={val_mse:.6f} did not improve (worse than {worse_than}: "
                 f"{reference:.6f}) | patience left={patience_left}"
             )
 
             if can_early_stop and patience_left <= 0:
                 logger.info(
                     f"[Finetune] Early stopping triggered at step {step} "
-                    f"(best_val_mse={best_val_mse:.6f})"
+                    f"({best_val_label}={best_val_mse:.6f})"
                 )
                 break
 
@@ -570,7 +603,7 @@ def finetune_and_test(
         _load_state_checked(model, best_state_cpu, where="FinetuneRestore")
         logger.info(
             f"[Finetune] Restored best model "
-            f"(val_mse={best_val_mse:.6f})"
+            f"({val_label}={best_val_mse:.6f})"
         )
     elif initial_state_dict_cpu is not None:
         # Reassigning best_state_cpu alone left `model` holding the final-step weights,
@@ -595,7 +628,7 @@ def finetune_and_test(
     model.eval()
     mse_vals, mae_vals = [], []
     test_cls_loss_total, test_cls_correct, test_cls_n = 0.0, 0, 0
-    test_num_classes = int(meta.get("num_classes") or 0)
+    test_num_classes = _resolve_num_classes(meta, is_classification, "Finetune")
     test_class_correct = torch.zeros(test_num_classes, dtype=torch.long)
     test_class_total = torch.zeros(test_num_classes, dtype=torch.long)
 
