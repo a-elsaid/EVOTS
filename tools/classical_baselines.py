@@ -111,11 +111,25 @@ def load_splits(dataset: str, split_mode: str, seed: int):
     train_loader, val_loader, test_loader, meta = ds_cfg.loader_fn(**ds_cfg.loader_kwargs)
 
     def flatten(loader):
+        """
+        Samples in dataset order.
+
+        Read from the dataset, not by iterating the loader: the train loader has
+        shuffle=True, so iterating it returns the same samples in a different
+        order every call, and that order changes lbfgs and MLP numerics enough
+        to make the same seed disagree with itself between invocations. Sklearn
+        does not need batches, so the shuffling serves nothing here.
+        """
+        ds = loader.dataset
+        if hasattr(ds, "X") and hasattr(ds, "y"):
+            return ds.X.numpy(), ds.y.numpy()
+
+        # Fallback for any other dataset type: one pass, X and y together, so a
+        # shuffled loader cannot pair features with another permutation's labels.
         xs, ys = [], []
         for batch in loader:
-            x, y = batch[0], batch[1]
-            xs.append(x.squeeze(1).numpy())   # [B, 1, F] -> [B, F]
-            ys.append(y.numpy())
+            xs.append(batch[0].squeeze(1).numpy())   # [B, 1, F] -> [B, F]
+            ys.append(batch[1].numpy())
         return np.concatenate(xs), np.concatenate(ys)
 
     return flatten(train_loader), flatten(val_loader), flatten(test_loader), meta, cfg

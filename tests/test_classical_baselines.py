@@ -238,3 +238,39 @@ def test_loader_pairing_is_stable_across_iterations():
     stored = sorted((tuple(np.round(ds.X[i].tolist(), 6)), int(ds.y[i]))
                     for i in range(len(ds)))
     assert one_pass(tr) == stored, "loader pairs differ from the dataset's own"
+
+
+# --------------------------------------------------------------- determinism
+
+@pytest.mark.parametrize("model", cb.ALL_MODELS)
+def test_same_seed_gives_identical_results(model):
+    """
+    Every estimator takes random_state from the run seed, so a rerun of the same
+    cell reproduces exactly. MLPClassifier matters most here: its weight init
+    and batch shuffling are random, so an unseeded one would make the same cell
+    disagree with itself between invocations.
+    """
+    require_tabular("iris")
+    a = cb.run_one(model, "iris", "clean", 0, Path("/unused"))
+    b = cb.run_one(model, "iris", "clean", 0, Path("/unused"))
+
+    for field in ("test_accuracy", "test_macro_accuracy", "best_val_loss",
+                  "hyperparameters", "best_params"):
+        assert a[field] == b[field], f"{model}: {field} differs between identical runs"
+
+
+def test_mlp_seed_actually_reaches_the_estimator():
+    """A different seed must change the MLP, or the seed is not wired through."""
+    require_tabular("iris")
+    seeds_differ = False
+    for seed in (1, 2, 3, 4, 5):
+        a = cb.build_model("mlp", {"hidden_layer_sizes": (64,), "alpha": 1e-4}, 0)
+        b = cb.build_model("mlp", {"hidden_layer_sizes": (64,), "alpha": 1e-4}, seed)
+        assert a.random_state == 0 and b.random_state == seed
+        (tr_X, tr_y), _, (te_X, _), meta, _ = cb.load_splits("iris", "clean", 0)
+        a.fit(tr_X, tr_y)
+        b.fit(tr_X, tr_y)
+        if not np.array_equal(a.predict(te_X), b.predict(te_X)):
+            seeds_differ = True
+            break
+    assert seeds_differ, "no seed changed the MLP's predictions; seed may be ignored"
