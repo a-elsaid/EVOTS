@@ -88,9 +88,22 @@ def mae_loss(y_hat: torch.Tensor, y: torch.Tensor) -> float:
     return torch.mean(torch.abs(y_hat - y)).item()
 
 
-def classification_accuracy(logits: torch.Tensor, y: torch.Tensor) -> float:
+def classification_correct(logits: torch.Tensor, y: torch.Tensor) -> int:
+    """
+    Count of correct predictions in this batch.
+
+    Metrics are accumulated as counts and divided once by the split's sample
+    total. Averaging per-batch rates instead weights a short final batch (every
+    loader uses drop_last=False) the same as a full one, which inflates or
+    deflates the reported number.
+    """
     preds = logits.argmax(dim=-1)
-    return (preds == y).float().mean().item()
+    return int((preds == y).sum().item())
+
+
+def classification_loss_sum(logits: torch.Tensor, y: torch.Tensor) -> float:
+    """Summed (not averaged) cross-entropy over this batch, for the same reason."""
+    return F.cross_entropy(logits, y, reduction="sum").item()
 
 
 def _get_optimizer(model: nn.Module, eval_cfg: EvalConfig):
@@ -183,6 +196,7 @@ def _train_and_eval_on_dataset(
         """
         model.eval()
         val_losses = []
+        cls_loss_total, cls_n = 0.0, 0
         with torch.no_grad():
             for batch in val_loader:
                 x, y, x_mark, y_mark = _unpack_batch(batch)
@@ -192,11 +206,16 @@ def _train_and_eval_on_dataset(
                 y_mark = y_mark.to(device)
                 y_hat = model(x, x_mark=x_mark, y_mark=y_mark)  # even if y_mark unused
                 if is_classification:
-                    val_losses.append(F.cross_entropy(y_hat, y).item())
+                    cls_loss_total += classification_loss_sum(y_hat, y)
+                    cls_n += int(y.size(0))
                 else:
                     y_hat_aligned, y_aligned = _align_pred_target(y_hat, y)
                     val_losses.append(torch.mean((y_hat_aligned - y_aligned) ** 2).item())
         model.train()
+        if is_classification:
+            if cls_n == 0:
+                return float("inf")
+            return float(cls_loss_total / cls_n)
         if not val_losses:
             return float("inf")
         return float(sum(val_losses) / len(val_losses))
@@ -263,8 +282,9 @@ def _train_and_eval_on_dataset(
     model.eval()
     mse_vals = []
     mae_vals = []
-    loss_vals = []
-    acc_vals = []
+    cls_loss_total = 0.0
+    cls_correct = 0
+    cls_n = 0
 
     latency = None
     measured_latency = False
@@ -291,8 +311,9 @@ def _train_and_eval_on_dataset(
 
             y_hat = model(x, x_mark=x_mark, y_mark=y_mark)
             if is_classification:
-                loss_vals.append(F.cross_entropy(y_hat, y).item())
-                acc_vals.append(classification_accuracy(y_hat, y))
+                cls_loss_total += classification_loss_sum(y_hat, y)
+                cls_correct += classification_correct(y_hat, y)
+                cls_n += int(y.size(0))
             else:
                 mse_vals.append(mse_loss(y_hat, y))
                 mae_vals.append(mae_loss(y_hat, y))
@@ -300,8 +321,8 @@ def _train_and_eval_on_dataset(
     params = count_parameters(model)
 
     if is_classification:
-        loss_mean = float(sum(loss_vals) / len(loss_vals)) if loss_vals else float("inf")
-        acc_mean = float(sum(acc_vals) / len(acc_vals)) if acc_vals else 0.0
+        loss_mean = float(cls_loss_total / cls_n) if cls_n else float("inf")
+        acc_mean = float(cls_correct / cls_n) if cls_n else 0.0
         metrics = {
             "loss": loss_mean,
             "accuracy": acc_mean,
@@ -449,6 +470,7 @@ def finetune_and_test(
 
         model.eval()
         val_mse_vals = []  # holds val loss: CE for classification, MSE for forecasting
+        val_cls_loss_total, val_cls_n = 0.0, 0
 
         with torch.no_grad():
             for batch in val_loader:
@@ -456,14 +478,18 @@ def finetune_and_test(
                 vx, vy, vx_mark, vy_mark = vx.to(device), vy.to(device), vx_mark.to(device), vy_mark.to(device)
                 vy_hat = model(vx, x_mark=vx_mark, y_mark=vy_mark)
                 if is_classification:
-                    val_mse_vals.append(criterion(vy_hat, vy).item())
+                    val_cls_loss_total += classification_loss_sum(vy_hat, vy)
+                    val_cls_n += int(vy.size(0))
                 else:
                     vy_hat, vy = _align_pred_target(vy_hat, vy)
                     val_mse_vals.append(mse_crit(vy_hat, vy).item())
 
         model.train()
 
-        val_mse = float(sum(val_mse_vals) / len(val_mse_vals)) if val_mse_vals else float("inf")
+        if is_classification:
+            val_mse = float(val_cls_loss_total / val_cls_n) if val_cls_n else float("inf")
+        else:
+            val_mse = float(sum(val_mse_vals) / len(val_mse_vals)) if val_mse_vals else float("inf")
 
         # ---- early stopping logic ----
         if val_mse < best_val_mse - early_stop_min_delta:
@@ -528,7 +554,7 @@ def finetune_and_test(
     # ---- test evaluation ----
     model.eval()
     mse_vals, mae_vals = [], []
-    loss_vals, acc_vals = [], []
+    test_cls_loss_total, test_cls_correct, test_cls_n = 0.0, 0, 0
 
     with torch.no_grad():
         for batch in test_loader:
@@ -536,16 +562,17 @@ def finetune_and_test(
             x, y, x_mark, y_mark = x.to(device), y.to(device), x_mark.to(device), y_mark.to(device)
             y_hat = model(x, x_mark=x_mark, y_mark=y_mark)
             if is_classification:
-                loss_vals.append(criterion(y_hat, y).item())
-                acc_vals.append(classification_accuracy(y_hat, y))
+                test_cls_loss_total += classification_loss_sum(y_hat, y)
+                test_cls_correct += classification_correct(y_hat, y)
+                test_cls_n += int(y.size(0))
             else:
                 y_hat, y = _align_pred_target(y_hat, y)
                 mse_vals.append(mse_crit(y_hat, y).item())
                 mae_vals.append(mae_crit(y_hat, y).item())
 
     if is_classification:
-        test_loss = float(sum(loss_vals) / len(loss_vals)) if loss_vals else float("inf")
-        test_acc = float(sum(acc_vals) / len(acc_vals)) if acc_vals else 0.0
+        test_loss = float(test_cls_loss_total / test_cls_n) if test_cls_n else float("inf")
+        test_acc = float(test_cls_correct / test_cls_n) if test_cls_n else 0.0
         logger.info(
             f"[Finetune] TEST results | "
             f"loss={test_loss:.6f} | accuracy={test_acc:.4f}"
