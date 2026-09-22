@@ -125,6 +125,10 @@ def build_results(
         "run_name": run_name,
         "config_path": str(config_path),
         "task_type": (cfg.get("task", {}) or {}).get("task_type"),
+        # Which EvoTS condition produced this run (classical, quantum, ...).
+        # Set by the suite runner; None for a run launched by hand, which the
+        # aggregation treats as classical and says so.
+        "condition": (cfg.get("run", {}) or {}).get("condition"),
 
         "dataset_path": tab.get("path"),
         # From meta, not the config: this is what the loader actually did.
