@@ -1,0 +1,193 @@
+# Real-budget QUANTUM classification search: seeds
+#
+# Budget matched to EXAQC (arXiv 2602.03840, github.com/travisdesell/exaqc):
+#   max_evals 500 genomes, steady-state population 50, 200 epochs per genome,
+#   Adam with lr 1e-3 and weight_decay 1e-4.
+#
+# NOT matched, and why each matters when reading the comparison:
+#   * Fitness. EXAQC selects on the MEAN of train and validation loss; we select
+#     on validation loss only. Theirs is partly a fit measure, ours purely a
+#     generalisation measure, so the two searches optimise different things.
+#   * Split. This file uses split_mode "clean" (stratified 70/15/15, scaler fitted
+#     on train only, test touched once). EXAQC uses a single stratified 80/20 with
+#     the 20% serving as BOTH validation and test, and scales on the full dataset
+#     before splitting. For a like-for-like number, override:
+#         --set data.tabular.split_mode=exaqc
+#     Numbers from "clean" are stricter than anything in their Table 1.
+#   * Weight inheritance. EvoTS currently does not inherit weights between
+#     genomes: weight_pool.update is commented out in evaluate.py, so
+#     use_weight_inheritance has no effect. Each genome trains from scratch.
+#   * Model class. EXAQC evolves quantum circuits; this evolves transformers.
+#     Parameter counts are not comparable.
+#   * Workers. EXAQC used 11. num_workers below matches, but the search is
+#     asynchronous steady-state: above 1 worker the completion order varies, so a
+#     whole run is not bit-reproducible. Individual genomes are, at any worker
+#     count, because evaluation is seeded from the genome's own ID.
+#
+#
+# QUANTUM CONDITION. Identical to configs/classification/seeds.yml except that
+# "quantum" joins block_types and the circuit genes below are searched. Run it
+# through the suite with:
+#     --condition quantum --config-dir configs/classification_quantum
+#
+# What this changes about the EXAQC comparison:
+#   * Model class, revisited. The classical config notes that EXAQC evolves
+#     quantum circuits while EvoTS evolves transformers. This config narrows but
+#     does not close that gap: a genome here is still a transformer whose blocks
+#     may MIX FEATURES through a simulated circuit, not a quantum classifier.
+#     EXAQC's circuit IS the model; here the circuit is one block among several,
+#     wrapped in classical projections, norms and a classical readout head.
+#     A win here is not evidence that a quantum circuit beats their circuit.
+#   * Simulated, not quantum hardware. tensorcircuit state-vector simulation is
+#     exact and noiseless. EXAQC simulate too, so this matches them, but neither
+#     number says anything about behaviour on a real device.
+#   * Everything else -- budget, fitness, split, weight inheritance, workers --
+#     matches the classical config, so quantum and classical conditions are
+#     directly comparable with each other.
+#
+# Cost, measured on CPU (see nas_ts/core/config.py for the full table):
+#   seeds: 16 x 7 = 112 tokens per vmapped call.
+#   One quantum block at n=12 costs ~1.7x a classical genome; cost grows roughly
+#   linearly with the NUMBER of quantum blocks in a genome (measured on breast
+#   cancer: 0 blocks 25.6 min/eval, 1 block 42.6, 2 blocks 63.6, 4 blocks 99.8),
+#   while peak memory plateaus because all blocks in a genome share one compiled
+#   circuit. The cluster runs on GPU, where these ratios will differ.
+# Dataset: 210 samples, 7 features, 3 classes.
+
+run:
+  name: seeds_quantum
+  logs_dir: logs/classification
+  checkpoints_dir: checkpoints/classification
+
+task:
+  task_type: classification
+  input_length: 1          # a tabular row is one "time step"
+  pred_length: 1           # unused for classification; kept for interface parity
+  d_in: 7
+  d_out: 7            # unused for classification; kept for interface parity
+  metrics: [loss, accuracy, macro_accuracy, params]
+  use_norm: false          # WindowNorm zeroes every feature at input_length 1
+
+data:
+  tabular:
+    path: data/tabular/seeds.csv
+    target_col: target
+    split_mode: clean      # override to "exaqc" for the like-for-like comparison
+    train_ratio: 0.7
+    val_ratio: 0.15        # test gets the remaining 0.15
+    batch_size: 16
+    num_workers: 0
+    normalize: true        # z-score, fitted on train only in "clean" mode
+    random_seed: 42        # the suite runner overrides this per seed
+
+eval:
+  training_steps: 200      # EPOCHS per genome during the search (matches EXAQC)
+  # extra_training_steps counts BATCHES, not epochs, unlike training_steps above.
+  # seeds: n_train=146 at batch_size 16 = ceil(146/16) = 10 batches per epoch.
+  # 10 x 200 epochs = 2000 batches for the final finetune of the search winner.
+  extra_training_steps: 2000
+  early_stopping: true
+  early_stop_patience: 10
+  early_stop_min_delta: 0.0
+  early_stop_checks: 1
+  optimizer: adam          # EXAQC uses Adam, not AdamW
+  optimizer_kwargs:
+    lr: 0.001              # 1e-3, matches EXAQC
+    weight_decay: 0.0001   # 1e-4, matches EXAQC
+  device: auto
+  gpu_ids: null
+
+selection:
+  mode: single
+  objectives: ["loss"]     # cross-entropy, lower is better
+
+search_space:
+  families: ["iT"]
+  # Only tokenizers that mean anything when the time axis has length 1:
+  #   var  = one shared Linear(1 -> d_model) per feature (iTransformer style)
+  #   none = a separate learned affine per feature, so equal-valued features
+  #          do not collide into identical tokens
+  stage_tokenizers: ["var", "none"]
+  stage_retokens: ["none", "cross_attn"]
+  stage_count_range: [1, 2]
+
+  # Pinned to "linear": at input_length 1 every var encoder collapses to an
+  # affine map of the same single value, so conv/fft/decomp_linear are just
+  # reparameterisations of linear here and would spend search budget on nothing.
+  # Verified empirically, not assumed.
+  var_encoder_types: ["linear"]
+  var_conv_kernels: [3]
+  var_fft_keep_ratios: [0.25]
+  var_decomp_kernels: [3]
+
+  # Cross-variable knobs are unused with the var/none tokenizers; kept so the
+  # config validates against SearchSpaceConfig.
+  cross_groups: [1]
+  cross_patch_sizes: [4]
+  cross_strides: [1]
+  cross_encoder_types: ["linear"]
+  cross_conv_kernels: [3]
+  cross_pools: ["avg"]
+  cross_fusions: ["add"]
+  patch_sizes: [4]
+  strides: [1]
+  overlaps: [0.0]
+  per_channel_options: [true]
+
+  # The dimensions actually worth searching for tabular data.
+  depth_range: [2, 8]
+  model_dim_range: [32, 256]     # num_heads is derived from this (head_dim 8)
+  num_heads_range: [2, 8]
+  ff_mult_range: [1.0, 4.0]
+  dropout_range: [0.0, 0.3]
+
+  # attn and inv_attn both operate over the feature-token axis. conv does too,
+  # which imposes an adjacency prior on columns whose order is arbitrary; it is
+  # left in so the search can select against it rather than being assumed bad.
+  block_types: ["attn", "inv_attn", "conv", "quantum"]
+  conv_kernel_sizes: [3, 5]
+  conv_dilations: [1]
+
+  # "absolute" gives each feature position a learned embedding, which is how the
+  # shared "var" tokenizer tells otherwise-identical features apart.
+  pos_encoding_options: ["none", "absolute"]
+
+  # Time-series operators over a length-1 time axis. Excluded: applying them
+  # across the feature axis instead would impose an ordering on unordered columns.
+  freq_types: ["none"]
+  freq_keep_ratios: [0.5]
+  decomp_modes: ["none"]
+  decomp_kernel_sizes: [3]
+
+  # ---- Circuit genes (searched) ----
+  # Ranges are the measured ones from nas_ts/core/config.py; see there for the
+  # cost and memory table and the CPU-measurement caveat.
+  quantum_encodings: ["amplitude", "angle"]
+  quantum_readouts: ["state", "prob", "expval_z"]
+  quantum_amplitude_qubits_range: [4, 12]
+  quantum_angle_qubits_range: [4, 14]
+  quantum_nlayers_range: [1, 3]
+  quantum_entangle_patterns: ["linear", "circular"]
+  quantum_gate_sets: ["rx_ry", "rx_ry_rz"]
+  quantum_use_ffn_options: [true, false]
+  quantum_reupload_options: [true, false]
+
+evo:
+  population_size: 50      # matches EXAQC
+  max_evals: 500           # matches EXAQC
+  init_seed_fraction: 0.0  # no hand-designed seeds: the templates are time-series shaped
+  mutation_rate: 0.3
+  crossover_rate: 0.7
+  steady_state: true
+  tournament_size: 2
+  use_weight_inheritance: false   # no effect today; see header
+  evals_per_generation: 50        # one "generation" row per population's worth
+  random_seed: 42                 # the suite runner overrides this per seed
+  num_workers: 11                 # matches EXAQC's 11 workers
+
+constraints:
+  min_blocks: 2
+  max_blocks: 8
+  max_conv_blocks: 8
+  max_freq_blocks: 8
+  max_cross_dim_blocks: 8
