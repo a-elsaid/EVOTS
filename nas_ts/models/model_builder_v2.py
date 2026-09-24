@@ -4,6 +4,7 @@ import contextlib
 import math
 import os
 from collections import OrderedDict
+from dataclasses import dataclass
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import torch
@@ -383,15 +384,81 @@ QUANTUM_READOUTS = ("state", "prob", "expval_z")
 QUANTUM_GATE_SETS = ("rx_ry", "rx_ry_rz")
 QUANTUM_ENTANGLE_PATTERNS = ("linear", "circular")
 
-# Compiled quantum circuits, shared process-wide and keyed on the circuit's
-# configuration. Deliberately module-level, never instance state: the value is a
+def _require_one_of(value: str, allowed: Tuple[str, ...], name: str) -> str:
+    if value not in allowed:
+        raise ValueError(
+            f"QuantumMixBlock: unknown {name} {value!r}, expected one of {list(allowed)}"
+        )
+    return value
+
+
+@dataclass(frozen=True)
+class CircuitSpec:
+    """Every value the compiled quantum circuit depends on — and nothing else.
+
+    This is the single declared source for the circuit's identity. `_compile_qpred`
+    takes only a CircuitSpec, and the compiled-circuit cache is keyed on the spec
+    OBJECT rather than a hand-written tuple, so the key and the compile input are
+    literally the same value. A new circuit-affecting field cannot be added to the
+    circuit without also entering the key, because the key is the whole object.
+
+    Frozen for two reasons: it must be hashable to serve as a dict key, and a spec
+    that could change after its circuit was cached would silently describe a
+    different circuit than the one the cache returns.
+
+    Note this deliberately excludes d_model. The circuit only ever sees `n_qubits`;
+    d_model governs the projections around it, which live in QuantumMixBlock.
+    """
+
+    n_qubits: int
+    nlayers: int
+    entangle_pattern: str
+    gate_set: str
+    encoding: str
+    readout: str
+    reupload: bool
+
+    def __post_init__(self) -> None:
+        # Canonicalise before hashing: a numpy int and a python int are equal but
+        # arrive from different callers, and the cache must not hold both.
+        object.__setattr__(self, "n_qubits", int(self.n_qubits))
+        object.__setattr__(self, "nlayers", int(self.nlayers))
+        object.__setattr__(self, "reupload", bool(self.reupload))
+        for name in ("entangle_pattern", "gate_set", "encoding", "readout"):
+            object.__setattr__(self, name, str(getattr(self, name)))
+
+        if self.n_qubits < 1:
+            raise ValueError(f"CircuitSpec: n_qubits must be >= 1, got {self.n_qubits}")
+        if self.nlayers < 1:
+            raise ValueError(f"CircuitSpec: nlayers must be >= 1, got {self.nlayers}")
+        _require_one_of(self.encoding, QUANTUM_ENCODINGS, "encoding")
+        _require_one_of(self.readout, QUANTUM_READOUTS, "readout")
+        _require_one_of(self.gate_set, QUANTUM_GATE_SETS, "gate_set")
+        _require_one_of(self.entangle_pattern, QUANTUM_ENTANGLE_PATTERNS, "entangle_pattern")
+
+    @property
+    def gates_per_layer(self) -> int:
+        """Weight rows per circuit layer: 2 for rx_ry, 3 for rx_ry_rz."""
+        return 3 if self.gate_set == "rx_ry_rz" else 2
+
+    @property
+    def state_width(self) -> int:
+        return 2 ** self.n_qubits
+
+    @property
+    def readout_width(self) -> int:
+        return self.n_qubits if self.readout == "expval_z" else self.state_width
+
+
+# Compiled quantum circuits, shared process-wide and keyed on CircuitSpec.
+# Deliberately module-level, never instance state: the value is a
 # tc.interfaces.torch_interface closure, which pickle cannot reference by name, so
 # anything reachable from a block's __dict__ would break sending models between
 # processes. QuantumMixBlock.__getstate__ already drops its own reference.
 #
 # Sharing is sound because the compiled function takes the trainable weights as an
 # ARGUMENT (qpred_batch(x_batch, weights)) and closes over nothing genome-specific —
-# only the seven fields in the key below.
+# only values carried by the spec.
 #
 # Two costs are avoided per re-use, both measured on the pre-cache code:
 #   ~5000 ms  first compile of a configuration
@@ -405,18 +472,10 @@ QUANTUM_ENTANGLE_PATTERNS = ("linear", "circular")
 # configuration space grows once encoding/readout/n_qubits are genes, and each entry
 # retains its compiled graphs plus one trace per input shape it has seen.
 _CIRCUIT_CACHE_MAXSIZE = 16
-_CIRCUIT_CACHE: "OrderedDict[tuple, Any]" = OrderedDict()
+_CIRCUIT_CACHE: "OrderedDict[CircuitSpec, Any]" = OrderedDict()
 
 
-def _compile_qpred(
-    n_qubits: int,
-    nlayers: int,
-    entangle_pattern: str,
-    gate_set: str,
-    encoding: str,
-    readout: str,
-    reupload: bool,
-):
+def _compile_qpred(spec: CircuitSpec):
     """Build and JIT-compile one per-token circuit. No reference to any block."""
     # NumPy 2.0 removed the top-level np.ComplexWarning alias; the class itself
     # still exists at numpy.exceptions.ComplexWarning. Older tensorcircuit
@@ -439,10 +498,15 @@ def _compile_qpred(
 
         K = tc.set_backend("tensorflow")
 
-    n = int(n_qubits)
-    nlayers = int(nlayers)
-    pattern = str(entangle_pattern)
-    gpl = 3 if gate_set == "rx_ry_rz" else 2  # gates per layer
+    # Unpacked into locals so the closures below capture plain values, never the
+    # spec object or anything reachable from it.
+    n = spec.n_qubits
+    nlayers = spec.nlayers
+    pattern = spec.entangle_pattern
+    encoding = spec.encoding
+    readout = spec.readout
+    reupload = spec.reupload
+    gpl = spec.gates_per_layer
 
     def qpred_batch(x_batch, weights):
         # x_batch : [T, 2^n] amplitude vectors, or [T, n] rotation angles
@@ -489,30 +553,19 @@ def _compile_qpred(
     return tc.interfaces.torch_interface(qpred_batch, jit=True)
 
 
-def _get_qpred(
-    *,
-    n_qubits: int,
-    nlayers: int,
-    entangle_pattern: str,
-    gate_set: str,
-    encoding: str,
-    readout: str,
-    reupload: bool,
-):
-    """Return the compiled circuit for this configuration, compiling on a miss."""
-    key = (int(n_qubits), int(nlayers), str(entangle_pattern), str(gate_set),
-           str(encoding), str(readout), bool(reupload))
+def _get_qpred(spec: CircuitSpec):
+    """Return the compiled circuit for this spec, compiling on a miss.
 
-    cached = _CIRCUIT_CACHE.get(key)
+    The spec is both the cache key and the sole input to the compiler, so the two
+    cannot drift apart.
+    """
+    cached = _CIRCUIT_CACHE.get(spec)
     if cached is not None:
-        _CIRCUIT_CACHE.move_to_end(key)  # mark most-recently-used
+        _CIRCUIT_CACHE.move_to_end(spec)  # mark most-recently-used
         return cached
 
-    fn = _compile_qpred(
-        n_qubits=n_qubits, nlayers=nlayers, entangle_pattern=entangle_pattern,
-        gate_set=gate_set, encoding=encoding, readout=readout, reupload=reupload,
-    )
-    _CIRCUIT_CACHE[key] = fn
+    fn = _compile_qpred(spec)
+    _CIRCUIT_CACHE[spec] = fn
     while len(_CIRCUIT_CACHE) > _CIRCUIT_CACHE_MAXSIZE:
         _CIRCUIT_CACHE.popitem(last=False)  # evict least-recently-used
     return fn
@@ -584,28 +637,12 @@ class QuantumMixBlock(nn.Module):
         readout = str(readout)
         n_qubits = int(n_qubits)
 
-        if encoding not in QUANTUM_ENCODINGS:
-            raise ValueError(
-                f"QuantumMixBlock: unknown encoding {encoding!r}, expected one of {list(QUANTUM_ENCODINGS)}"
-            )
-        if readout not in QUANTUM_READOUTS:
-            raise ValueError(
-                f"QuantumMixBlock: unknown readout {readout!r}, expected one of {list(QUANTUM_READOUTS)}"
-            )
-        # Validated for the same reason as encoding/readout: the circuit selects the
-        # gate count with `3 if gate_set == "rx_ry_rz" else 2` and the entangler with
-        # `pattern == "circular"`, so an unrecognised value would silently fall through
-        # to rx_ry / linear and train a different circuit than the genome describes.
-        if str(gate_set) not in QUANTUM_GATE_SETS:
-            raise ValueError(
-                f"QuantumMixBlock: unknown gate_set {gate_set!r}, "
-                f"expected one of {list(QUANTUM_GATE_SETS)}"
-            )
-        if str(entangle_pattern) not in QUANTUM_ENTANGLE_PATTERNS:
-            raise ValueError(
-                f"QuantumMixBlock: unknown entangle_pattern {entangle_pattern!r}, "
-                f"expected one of {list(QUANTUM_ENTANGLE_PATTERNS)}"
-            )
+        # encoding is checked here, ahead of CircuitSpec, because resolving n_qubits
+        # below branches on it — an unrecognised value would otherwise surface as a
+        # confusing d_model error instead of naming the real problem. Every other
+        # circuit field is validated once, inside CircuitSpec.
+        _require_one_of(encoding, QUANTUM_ENCODINGS, "encoding")
+
         if encoding == "angle" and n_qubits <= 0:
             # Deriving log2(d_model) here would silently give angle encoding a very
             # narrow circuit; repair_genome is responsible for assigning the width.
@@ -614,9 +651,7 @@ class QuantumMixBlock(nn.Module):
                 f"(got {n_qubits}); repair_genome assigns it from quantum_angle_qubits_range"
             )
 
-        if n_qubits > 0:
-            self.n_qubits = n_qubits
-        else:
+        if n_qubits <= 0:
             # Amplitude encoding with no projection loads the token directly as the
             # state vector, so the register must be exactly wide enough to hold it.
             if (d_model & (d_model - 1)) != 0 or d_model <= 0:
@@ -624,25 +659,33 @@ class QuantumMixBlock(nn.Module):
                     "QuantumMixBlock: amplitude encoding without an explicit n_qubits "
                     f"requires d_model to be a power of 2, got {d_model}"
                 )
-            self.n_qubits = int(math.log2(d_model))
+            n_qubits = int(math.log2(d_model))
+
+        # The spec is this block's circuit identity: the sole input to the compiler
+        # and the cache key. Everything circuit-related is read back off it rather
+        # than duplicated onto self, so the two cannot disagree. It validates the
+        # remaining fields (readout, gate_set, entangle_pattern) on construction.
+        self.circuit_spec = CircuitSpec(
+            n_qubits=n_qubits,
+            nlayers=nlayers,
+            entangle_pattern=entangle_pattern,
+            gate_set=gate_set,
+            encoding=encoding,
+            readout=readout,
+            reupload=reupload,
+        )
 
         self.d_model = d_model
-        self.encoding = encoding
-        self.readout = readout
-        self.reupload = bool(reupload)
-        self.nlayers = int(nlayers)
-        self.entangle_pattern = str(entangle_pattern)
-        self.gate_set = str(gate_set)  # "rx_ry" | "rx_ry_rz"
         self.use_ffn = bool(use_ffn)
 
-        state_width = 2 ** self.n_qubits
-        self.readout_width = self.n_qubits if readout == "expval_z" else state_width
+        state_width = self.circuit_spec.state_width
+        readout_width = self.circuit_spec.readout_width
 
         # ---- input projection (None on the default path) ----
         if encoding == "angle":
             # q_weights already supplies a learnable additive per-qubit offset on
             # theta, so a bias here would duplicate that degree of freedom.
-            self.in_proj: Optional[nn.Module] = nn.Linear(d_model, self.n_qubits, bias=False)
+            self.in_proj: Optional[nn.Module] = nn.Linear(d_model, n_qubits, bias=False)
         elif state_width != d_model:
             self.in_proj = nn.Linear(d_model, state_width)
         else:
@@ -650,13 +693,13 @@ class QuantumMixBlock(nn.Module):
 
         # ---- readout projection (None on the default path) ----
         self.out_proj: Optional[nn.Module] = (
-            None if self.readout_width == d_model else nn.Linear(self.readout_width, d_model)
+            None if readout_width == d_model else nn.Linear(readout_width, d_model)
         )
 
-        # Weight rows per circuit layer: 2 for rx_ry, 3 for rx_ry_rz
-        gates_per_layer = 3 if self.gate_set == "rx_ry_rz" else 2
         self.q_weights = nn.Parameter(
-            torch.empty(gates_per_layer * self.nlayers, self.n_qubits).uniform_(-math.pi, math.pi)
+            torch.empty(
+                self.circuit_spec.gates_per_layer * self.circuit_spec.nlayers, n_qubits
+            ).uniform_(-math.pi, math.pi)
         )
 
         # gate_norm normalises the readout before the multiplicative gate.
@@ -678,23 +721,32 @@ class QuantumMixBlock(nn.Module):
         # Built on first forward; not part of module state (reconstructible from hparams)
         self._qpred_torch = None
 
+    # ---- circuit configuration: read through to the spec, never duplicated ----
+    @property
+    def n_qubits(self) -> int:
+        return self.circuit_spec.n_qubits
+
+    @property
+    def encoding(self) -> str:
+        return self.circuit_spec.encoding
+
+    @property
+    def readout(self) -> str:
+        return self.circuit_spec.readout
+
+    @property
+    def readout_width(self) -> int:
+        return self.circuit_spec.readout_width
+
     # ------------------------------------------------------------------
     def _build_circuit(self) -> None:
-        """Fetch (or compile) the per-token circuit for this block's configuration.
+        """Fetch (or compile) the per-token circuit for this block's spec.
 
-        The compiled function is shared process-wide across every block with the
-        same configuration — see _get_qpred. It is assigned to self._qpred_torch as
-        before, and __getstate__ still drops it, so pickling behaviour is unchanged.
+        The compiled function is shared process-wide across every block with an
+        equal spec — see _get_qpred. It is assigned to self._qpred_torch as before,
+        and __getstate__ still drops it, so pickling behaviour is unchanged.
         """
-        self._qpred_torch = _get_qpred(
-            n_qubits=self.n_qubits,
-            nlayers=self.nlayers,
-            entangle_pattern=self.entangle_pattern,
-            gate_set=self.gate_set,
-            encoding=self.encoding,
-            readout=self.readout,
-            reupload=self.reupload,
-        )
+        self._qpred_torch = _get_qpred(self.circuit_spec)
 
     # ------------------------------------------------------------------
     def __getstate__(self):

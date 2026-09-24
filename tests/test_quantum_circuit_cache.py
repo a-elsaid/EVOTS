@@ -18,13 +18,16 @@ circuit.
 
 from __future__ import annotations
 
+import inspect
 import pickle
+from dataclasses import FrozenInstanceError, fields
 
 import pytest
 import torch
 
 import nas_ts.models.model_builder_v2 as M
 from nas_ts.models.model_builder_v2 import (
+    CircuitSpec,
     QuantumMixBlock,
     circuit_cache_info,
     clear_circuit_cache,
@@ -110,14 +113,17 @@ def test_identical_config_shares_one_entry():
 
 
 def test_all_key_fields_are_covered_by_the_cases():
-    """Guards this file itself: a new key field must gain a case above."""
+    """Guards this file itself: a new field on CircuitSpec must gain a case above.
+
+    CircuitSpec is the single declared source for the circuit's identity, so
+    comparing against its field names catches a new gene that was added to the
+    circuit but never exercised for cache separation here.
+    """
     covered = {case[0] for case in KEY_FIELD_CASES}
-    clear_circuit_cache()
-    _compile(_block())
-    key = circuit_cache_info()["keys"][0]
-    assert len(key) == len(covered), (
-        f"cache key has {len(key)} components but only {len(covered)} fields are "
-        f"exercised by KEY_FIELD_CASES: {sorted(covered)}"
+    declared = {f.name for f in fields(CircuitSpec)}
+    assert declared == covered, (
+        f"CircuitSpec fields not exercised by KEY_FIELD_CASES: {sorted(declared - covered)}; "
+        f"cases naming fields that no longer exist: {sorted(covered - declared)}"
     )
 
 
@@ -135,7 +141,7 @@ def test_lru_evicts_oldest_and_recompiles_identically():
         _compile(_block(readout="expval_z"))
 
         assert circuit_cache_info()["size"] == 2
-        readouts = [k[5] for k in circuit_cache_info()["keys"]]
+        readouts = [k.readout for k in circuit_cache_info()["keys"]]
         assert "state" not in readouts, "LRU should have evicted the oldest entry"
 
         torch.manual_seed(5)
@@ -144,6 +150,86 @@ def test_lru_evicts_oldest_and_recompiles_identically():
     finally:
         M._CIRCUIT_CACHE_MAXSIZE = original_max
         clear_circuit_cache()
+
+
+def test_compile_takes_only_the_spec():
+    """The structural guarantee behind keying on CircuitSpec.
+
+    The cache key is the spec object, so anything the compiler branches on must
+    arrive through the spec. A second parameter would be a value that influences the
+    circuit but is absent from the key — the exact silent-collision failure this
+    design exists to prevent.
+    """
+    params = list(inspect.signature(M._compile_qpred).parameters)
+    assert params == ["spec"], (
+        f"_compile_qpred takes {params}; anything not on CircuitSpec is invisible to "
+        "the cache key and will collide silently"
+    )
+
+
+def test_equal_specs_share_an_entry_and_unequal_ones_do_not():
+    """The key is the spec's value, not its identity."""
+    clear_circuit_cache()
+    a, b = _block(), _block()
+    assert a.circuit_spec == b.circuit_spec
+    assert a.circuit_spec is not b.circuit_spec       # distinct objects
+    assert hash(a.circuit_spec) == hash(b.circuit_spec)
+    _compile(a)
+    _compile(b)
+    assert circuit_cache_info()["size"] == 1
+    assert circuit_cache_info()["keys"][0] == a.circuit_spec
+
+
+def test_spec_is_frozen():
+    """A mutable spec could describe a different circuit than the one cached under it."""
+    spec = _block().circuit_spec
+    with pytest.raises(FrozenInstanceError):
+        spec.readout = "prob"
+
+
+def test_block_does_not_duplicate_circuit_fields():
+    """Circuit config is read through to the spec, so the two cannot disagree."""
+    block = _block()
+    for name in (f.name for f in fields(CircuitSpec)):
+        assert name not in block.__dict__, (
+            f"{name!r} is stored on the block as well as on the spec; a copy can drift "
+            "out of sync with the value the cache is keyed on"
+        )
+    # the read-through accessors still work
+    assert block.n_qubits == block.circuit_spec.n_qubits
+    assert block.encoding == block.circuit_spec.encoding
+    assert block.readout == block.circuit_spec.readout
+    assert block.readout_width == block.circuit_spec.readout_width
+
+
+@pytest.mark.parametrize(
+    "overrides,expected",
+    [
+        ({"readout": "counts"}, "readout"),
+        ({"gate_set": "rx"}, "gate_set"),
+        ({"entangle_pattern": "ring"}, "entangle_pattern"),
+        ({"encoding": "basis"}, "encoding"),
+        ({"n_qubits": 0}, "n_qubits"),
+        ({"nlayers": 0}, "nlayers"),
+    ],
+)
+def test_spec_validates_itself(overrides, expected):
+    """CircuitSpec is independently constructible, so it owns its invariants."""
+    kwargs = dict(n_qubits=4, nlayers=1, entangle_pattern="linear", gate_set="rx_ry",
+                  encoding="amplitude", readout="state", reupload=False)
+    kwargs.update(overrides)
+    with pytest.raises(ValueError, match=expected):
+        CircuitSpec(**kwargs)
+
+
+def test_spec_canonicalises_types():
+    """A bool-valued int and a real bool must not occupy two cache slots."""
+    a = CircuitSpec(n_qubits=4, nlayers=1, entangle_pattern="linear", gate_set="rx_ry",
+                    encoding="amplitude", readout="state", reupload=0)
+    b = CircuitSpec(n_qubits=4, nlayers=1, entangle_pattern="linear", gate_set="rx_ry",
+                    encoding="amplitude", readout="state", reupload=False)
+    assert a == b and hash(a) == hash(b)
+    assert a.reupload is False
 
 
 def test_cache_is_not_reachable_from_instance_state():
