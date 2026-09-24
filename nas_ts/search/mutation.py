@@ -6,7 +6,7 @@ from typing import Optional
 
 from ..core.config import SearchSpaceConfig, GenomeConstraints, EvolutionConfig
 from ..core.genome_v2 import Genome, StageSpec, BlockSpec
-from .repair import repair_genome
+from .repair import _qubits_range, repair_genome
 
 
 # -------------------------
@@ -68,6 +68,22 @@ def _maybe_randomize_quantum_block(g: Genome, ss: SearchSpaceConfig) -> None:
 
     ffn_opts = list(getattr(ss, "quantum_use_ffn_options", [True, False]))
     g.quantum_block.use_ffn = random.choice(ffn_opts)
+
+    encodings = list(getattr(ss, "quantum_encodings", ["amplitude", "angle"]))
+    g.quantum_block.encoding = random.choice(encodings)
+
+    readouts = list(getattr(ss, "quantum_readouts", ["state", "prob", "expval_z"]))
+    g.quantum_block.readout = random.choice(readouts)
+
+    reupload_opts = list(getattr(ss, "quantum_reupload_options", [True, False]))
+    g.quantum_block.reupload = random.choice(reupload_opts)
+
+    # Drawn against the encoding chosen just above, and never left at 0: angle
+    # encoding raises at build time on 0, which scores inf and reads as a bad
+    # architecture. repair_genome re-checks this, but a mutation that produced an
+    # unbuildable genome would be relying on repair to run afterwards.
+    lo, hi = _qubits_range(ss, g.quantum_block.encoding)
+    g.quantum_block.n_qubits = random.randint(lo, hi)
 
 
 def _maybe_randomize_conv_block(g: Genome, ss: SearchSpaceConfig) -> None:

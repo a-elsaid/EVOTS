@@ -152,6 +152,14 @@ def crossover_genome(
         pos_encoding=str(random.choice([parent1.pos_encoding, parent2.pos_encoding])),
         dropout=float(random.choice([parent1.dropout, parent2.dropout])),
         stages=child_stages,
+        # Deep-copied, not referenced: the child goes on to be mutated, and a
+        # shared spec object would rewrite the parent still sitting in the
+        # population. Without this line the child gets a default QuantumBlockSpec
+        # and repair_genome re-randomises it, so quantum genes are not inherited
+        # at all -- two parents that agree on a circuit produce children that do not.
+        quantum_block=copy.deepcopy(
+            random.choice([parent1.quantum_block, parent2.quantum_block])
+        ),
     )
 
     return repair_genome(child, ss)
