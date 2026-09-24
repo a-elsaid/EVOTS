@@ -13,6 +13,53 @@ def _round_pow2(x: int) -> int:
     return lower if (x - lower) <= (upper - x) else upper
 
 
+def _qubits_range(ss: SearchSpaceConfig, encoding: str) -> tuple:
+    """
+    The qubit range for this encoding.
+
+    Amplitude and angle get separate ranges because they cost different things:
+    amplitude loads 2^n amplitudes through a d_model -> 2^n projection, angle only
+    needs d_model -> n, so the same n is far cheaper for angle.
+    """
+    name = ("quantum_amplitude_qubits_range" if encoding == "amplitude"
+            else "quantum_angle_qubits_range")
+    lo, hi = getattr(ss, name, (8, 8))
+    lo, hi = int(lo), int(hi)
+    return (lo, hi) if lo <= hi else (hi, lo)
+
+
+def _repair_quantum_qubits(genome: Genome, ss: SearchSpaceConfig) -> None:
+    """
+    Give the block a circuit width its encoding can actually build.
+
+    Angle encoding raises at build time on n_qubits <= 0, and a genome that fails
+    to build scores inf — indistinguishable from a genuinely bad architecture. So
+    angle must always leave here with an explicit width in range.
+
+    Amplitude keeps 0 as a meaningful value: it means "use the native width",
+    n = log2(d_model), with no input projection. That is the cheapest amplitude
+    configuration and the behaviour every pre-gene genome had, so it is preserved
+    rather than overwritten — but only while d_model is a power of two, which is
+    what makes it legal. Step 5 above guarantees that; the check is here so a
+    change to model_dim repair cannot silently start producing unbuildable genomes.
+    """
+    q = genome.quantum_block
+    lo, hi = _qubits_range(ss, q.encoding)
+    n = int(q.n_qubits)
+
+    if q.encoding == "amplitude":
+        d = int(genome.model_dim)
+        native_ok = d > 0 and (d & (d - 1)) == 0
+        if n == 0 and native_ok:
+            return
+        if n == 0:
+            q.n_qubits = random.randint(lo, hi)
+            return
+
+    if not (lo <= n <= hi):
+        q.n_qubits = random.randint(lo, hi)
+
+
 def _random_block(ss: SearchSpaceConfig) -> BlockSpec:
     return BlockSpec(
         block_type=random.choice(ss.block_types),
@@ -153,6 +200,9 @@ def repair_genome(genome: Genome, ss: SearchSpaceConfig) -> Genome:
         nlayers_range = getattr(ss, "quantum_nlayers_range", (1, 3))
 
         valid_gate_sets = list(getattr(ss, "quantum_gate_sets", ["rx_ry", "rx_ry_rz"]))
+        valid_encodings = list(getattr(ss, "quantum_encodings", ["amplitude", "angle"]))
+        valid_readouts = list(getattr(ss, "quantum_readouts", ["state", "prob", "expval_z"]))
+        valid_reupload = list(getattr(ss, "quantum_reupload_options", [True, False]))
 
         if not was_q_enabled:
             # Newly enabled — randomise all knobs
@@ -160,6 +210,13 @@ def repair_genome(genome: Genome, ss: SearchSpaceConfig) -> Genome:
             genome.quantum_block.entangle_pattern = random.choice(valid_patterns)
             genome.quantum_block.gate_set = random.choice(valid_gate_sets)
             genome.quantum_block.use_ffn = random.choice(valid_ffn)
+            genome.quantum_block.encoding = random.choice(valid_encodings)
+            genome.quantum_block.readout = random.choice(valid_readouts)
+            genome.quantum_block.reupload = random.choice(valid_reupload)
+            # Explicit width for a fresh block, drawn from the encoding just
+            # chosen above — never left at 0, which angle cannot build.
+            e_lo, e_hi = _qubits_range(ss, genome.quantum_block.encoding)
+            genome.quantum_block.n_qubits = random.randint(e_lo, e_hi)
         else:
             # Already enabled — only fix out-of-range values
             lo, hi = int(nlayers_range[0]), int(nlayers_range[1])
@@ -171,6 +228,17 @@ def repair_genome(genome: Genome, ss: SearchSpaceConfig) -> Genome:
                 genome.quantum_block.gate_set = random.choice(valid_gate_sets)
             if genome.quantum_block.use_ffn not in valid_ffn:
                 genome.quantum_block.use_ffn = random.choice(valid_ffn)
+            if genome.quantum_block.encoding not in valid_encodings:
+                genome.quantum_block.encoding = random.choice(valid_encodings)
+            if genome.quantum_block.readout not in valid_readouts:
+                genome.quantum_block.readout = random.choice(valid_readouts)
+            if genome.quantum_block.reupload not in valid_reupload:
+                genome.quantum_block.reupload = random.choice(valid_reupload)
+
+        # Last, and in both branches: the width depends on the encoding settled
+        # above, so a mutation from amplitude to angle re-draws it against the
+        # angle range rather than keeping a width from the wrong one.
+        _repair_quantum_qubits(genome, ss)
 
     # 10) Repair cross_head params
     if genome.cross_head.enabled:
