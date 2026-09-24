@@ -133,17 +133,38 @@ class SearchSpaceConfig:
     quantum_gate_sets: List[str] = field(default_factory=lambda: ["rx_ry", "rx_ry_rz"])
     quantum_use_ffn_options: List[bool] = field(default_factory=lambda: [True, False])
 
-    # TODO(phase-3): the two qubit ranges below are PLACEHOLDERS. Set them from
-    # tools/bench_quantum.py measurements before enabling the encoding/readout genes
-    # in mutation and repair. Simulation cost is 2^n complex amplitudes per token,
-    # vmapped over B*N tokens, so an over-wide range makes workers OOM — and a worker
-    # OOM surfaces as inf fitness, indistinguishable from a genuinely bad architecture.
-    # Amplitude and angle get separate ranges deliberately: amplitude packs 2^n values
-    # into n qubits, angle only n, so angle needs a wider circuit for the same capacity.
+    # Qubit ranges set from measurement, not guesswork. Simulation cost is 2^n
+    # complex amplitudes per token, vmapped over B*N tokens, so an over-wide range
+    # makes workers OOM — and a worker OOM surfaces as inf fitness,
+    # indistinguishable from a genuinely bad architecture.
+    #
+    # MEASURED ON CPU (Apple Silicon laptop), at breast-cancer scale: batch 32,
+    # 30 tokens per sample, d_model 256, so 960 tokens per vmapped call — the
+    # widest of the four classification datasets. Figures are one full training
+    # evaluation (200 epochs x 13 batches) with a single quantum block in the
+    # model, against a classical genome of the same shape:
+    #
+    #   amplitude  n=8   21.5 min  1.1 GB   0.9x classical
+    #   amplitude  n=12  42.4 min  1.8 GB   1.7x        (expval_z: 62 min, 2.4 GB)
+    #   amplitude  n=14 145.8 min  3.8 GB   5.9x        (expval_z: 316 min, 8.6 GB)
+    #   angle      n=12  22.1 min  1.3 GB   0.9x
+    #   angle      n=14  26.5 min  2.1 GB   1.1x        (expval_z: 138 min, 7.7 GB)
+    #
+    # Amplitude stops at 12: at 14 it costs 6-13x a classical genome and peaks at
+    # 3.8-8.6 GB per worker, which is 42-95 GB across the 11 workers the configs
+    # request. Angle reaches 14 for ~1x, because its input projection is
+    # d_model -> n rather than d_model -> 2^n; that asymmetry is why the two
+    # encodings get separate ranges rather than one shared one.
+    #
+    # The cluster runs on GPU, where the arithmetic is far cheaper relative to
+    # memory traffic, so these ratios will not carry over directly — expect the
+    # wall-clock multipliers to shrink and the memory ceiling to bind sooner (GPU
+    # RAM per worker is smaller than host RAM). Re-measure with
+    # tools/bench_quantum.py --device cuda before trusting either bound there.
     quantum_encodings: List[str] = field(default_factory=lambda: ["amplitude", "angle"])
     quantum_readouts: List[str] = field(default_factory=lambda: ["state", "prob", "expval_z"])
-    quantum_amplitude_qubits_range: Tuple[int, int] = (8, 8)   # PLACEHOLDER
-    quantum_angle_qubits_range: Tuple[int, int] = (8, 8)       # PLACEHOLDER
+    quantum_amplitude_qubits_range: Tuple[int, int] = (4, 12)
+    quantum_angle_qubits_range: Tuple[int, int] = (4, 14)
     quantum_reupload_options: List[bool] = field(default_factory=lambda: [True, False])
 
     # ---- Stages (for genome_v2) ----
