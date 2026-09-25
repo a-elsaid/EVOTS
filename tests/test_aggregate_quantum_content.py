@@ -65,6 +65,65 @@ def test_tolerates_a_malformed_genome():
     assert agg.count_quantum_blocks({"best_genome": {"stages": [{"blocks": None}]}}) == 0
 
 
+@pytest.mark.parametrize("genome", [
+    {"stages": ["stage0"]},                                  # stage is a string
+    {"stages": [["blocks"]]},                                # stage is a list
+    {"stages": [{"blocks": ["attn", "quantum"]}]},           # blocks are strings
+    {"stages": [{"blocks": 7}]},                             # blocks is a scalar
+    {"stages": [None, "x", {"blocks": [None]}]},             # mixed junk
+])
+def test_malformed_entries_are_skipped_not_raised(genome):
+    """
+    These files come from runs that took days on a cluster. One damaged record
+    must not take down the whole table, so a truthy non-dict entry is skipped
+    rather than raised on -- it used to raise AttributeError.
+    """
+    assert agg.count_quantum_blocks({"best_genome": genome}) == 0
+
+
+def test_counts_what_it_can_around_a_malformed_entry():
+    """Partial data is still worth reporting: the good blocks are counted."""
+    genome = {"stages": [
+        {"blocks": [{"block_type": "quantum"}, "junk", {"block_type": "attn"}]},
+        {"blocks": [{"block_type": "quantum"}]},
+    ]}
+    assert agg.count_quantum_blocks({"best_genome": genome}) == 2
+
+
+def test_malformed_entries_warn_and_name_the_run(capsys):
+    """A silent skip would understate the count with nothing to show for it."""
+    agg.count_quantum_blocks({
+        "run_name": "quantum_iris_clean_seed3",
+        "best_genome": {"stages": [{"blocks": ["junk"]}]},
+    })
+    err = capsys.readouterr().err
+    assert "quantum_iris_clean_seed3" in err
+    assert "malformed" in err
+
+
+def test_a_clean_genome_warns_about_nothing(capsys):
+    agg.count_quantum_blocks({"best_genome": _genome(["attn", "quantum", "conv", "attn"])})
+    assert capsys.readouterr().err == ""
+
+
+def test_a_malformed_record_does_not_break_the_whole_table(tmp_path):
+    """End to end: one damaged record, the other rows still render."""
+    write_result(tmp_path, "quantum_iris_clean_seed0", data_split_seed=0,
+                 best_genome=_genome(["attn", "quantum", "conv", "quantum"]))
+    write_result(tmp_path, "quantum_iris_clean_seed1", data_split_seed=1,
+                 best_genome={"stages": ["corrupted"]})
+
+    code = agg.main(["--results-dir", str(tmp_path), "--datasets", "iris",
+                     "--split-modes", "clean", "--seeds", "0", "1"])
+    assert code == 0
+    md = (tmp_path / "comparison.md").read_text()
+    assert "EvoTS (quantum)" in md
+    q = agg.collect(agg.load_results(tmp_path)[0], {"iris"}, {"clean"}, [0, 1])[
+        ("iris", "clean", "EvoTS (quantum)")]["quantum"]
+    assert q["n"] == 2          # both runs counted, one of them as zero
+    assert q["mean"] == pytest.approx(1.0)
+
+
 # --------------------------------------------------------------- the cell
 
 def test_cell_reports_mean_and_zero_fraction(tmp_path):

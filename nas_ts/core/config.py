@@ -135,8 +135,10 @@ class SearchSpaceConfig:
 
     # Qubit ranges set from measurement, not guesswork. Simulation cost is 2^n
     # complex amplitudes per token, vmapped over B*N tokens, so an over-wide range
-    # makes workers OOM — and a worker OOM surfaces as inf fitness,
-    # indistinguishable from a genuinely bad architecture.
+    # makes workers run out of memory. A Python-level allocation failure is caught
+    # and scores that genome inf, indistinguishable from a genuinely bad
+    # architecture; a native OOM kills the worker, breaks the process pool and
+    # takes down the whole run, which the suite then records as failed.
     #
     # MEASURED ON CPU (Apple Silicon laptop), at breast-cancer scale: batch 32,
     # 30 tokens per sample, d_model 256, so 960 tokens per vmapped call — the

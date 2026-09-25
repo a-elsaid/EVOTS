@@ -406,10 +406,26 @@ The configs request **11 workers**, so multiply by 11 for the node: 8.6 GB per
 worker is ~95 GB. That is why `quantum_amplitude_qubits_range` stops at 12, and why
 breast cancer caps angle at 12 while the smaller datasets allow 14.
 
-A worker that runs out of memory dies, and the suite records that genome as `inf`
-fitness — **indistinguishable from a genuinely bad architecture**. If a quantum
-sweep produces suspiciously many `inf` results, suspect memory before suspecting
-the search.
+Running out of memory has two different outcomes, and they look nothing alike:
+
+- **A Python-level allocation failure** (torch raising, rather than the OS
+  intervening) is caught by the worker, and that one genome is scored `inf` — the
+  search continues, and an `inf` is **indistinguishable from a genuinely bad
+  architecture**.
+- **A native OOM** — the OS killing the worker process — is the more likely one at
+  high qubit counts. It breaks the process pool, which propagates out of the
+  backend and **takes down the whole run**, not just that genome. The suite
+  records the run as `failed` with the error, archives the attempt, and carries on
+  to the next run.
+
+So a quantum condition that is too wide for the node **does not show up as poor
+accuracy**. It shows up as *failed runs*, listed by name under "Runs not included"
+in `comparison.md`, with a cell whose `n` is lower than the number of seeds you
+asked for. Check that section before reading any quantum row: a row averaging 3 of
+10 seeds because the other 7 died of memory is not a result.
+
+If you see that, lower the qubit range in the config or `evo.num_workers`, and
+re-run the suite — finished runs are skipped, so only the failures are retried.
 
 **These are CPU figures and the cluster runs on GPU.** Expect the wall-clock
 multipliers to shrink (the arithmetic parallelises well) but the memory ceiling to

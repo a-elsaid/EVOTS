@@ -111,6 +111,11 @@ def count_quantum_blocks(record: dict):
     None (not 0) when there is no genome to count -- a baseline, a failed run, a
     record from before best_genome was written. 0 means "a genome, and it has no
     quantum block", which is the finding worth surfacing.
+
+    Malformed entries are skipped and warned about rather than raised on. This
+    reads files written by runs that took days on a cluster; one damaged record
+    must not take down the whole table, and a silent skip would understate the
+    count with nothing to show for it.
     """
     genome = record.get("best_genome")
     if not isinstance(genome, dict):
@@ -118,11 +123,29 @@ def count_quantum_blocks(record: dict):
     stages = genome.get("stages")
     if not isinstance(stages, list):
         return None
-    n = 0
+
+    n, skipped = 0, 0
     for stage in stages:
-        for block in (stage or {}).get("blocks") or []:
-            if (block or {}).get("block_type") == "quantum":
+        if not isinstance(stage, dict):
+            skipped += 1
+            continue
+        blocks = stage.get("blocks")
+        if not isinstance(blocks, list):
+            if blocks is not None:
+                skipped += 1
+            continue
+        for block in blocks:
+            if not isinstance(block, dict):
+                skipped += 1
+                continue
+            if block.get("block_type") == "quantum":
                 n += 1
+
+    if skipped:
+        run = record.get("run_name") or "<unnamed run>"
+        print(f"[Aggregate] {run}: skipped {skipped} malformed genome entr"
+              f"{'y' if skipped == 1 else 'ies'} while counting quantum blocks; "
+              f"the count for this run may be low.", file=sys.stderr)
     return n
 
 
