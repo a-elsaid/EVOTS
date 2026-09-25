@@ -171,4 +171,4 @@ def crossover_genome(
         ),
     )
 
-    return repair_genome(child, ss)
+    return repair_genome(child, ss, constraints)

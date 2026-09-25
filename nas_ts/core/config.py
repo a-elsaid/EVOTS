@@ -205,6 +205,14 @@ class GenomeConstraints:
     max_freq_blocks: int = 4
     max_cross_dim_blocks: int = 4
 
+    # Floor on quantum blocks per genome. 0 (the default) leaves the search free
+    # to reject quantum entirely, which is what every existing config does.
+    # Setting it to 1 or more forces every genome to contain a circuit, turning
+    # "is a circuit useful here" into "what is the best circuit-containing
+    # architecture" -- a different question, so it gets its own config directory
+    # rather than changing the free condition.
+    min_quantum_blocks: int = 0
+
 
 @dataclass
 class ExperimentConfig:

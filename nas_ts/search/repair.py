@@ -60,6 +60,37 @@ def _repair_quantum_qubits(genome: Genome, ss: SearchSpaceConfig) -> None:
         q.n_qubits = random.randint(lo, hi)
 
 
+def _enforce_min_quantum_blocks(genome: Genome, constraints) -> None:
+    """
+    Convert randomly chosen non-quantum blocks until the floor is met.
+
+    Conversion rather than insertion, deliberately: the total block count is
+    unchanged, so min_blocks and max_blocks stay satisfied without this function
+    needing to know about them. Converting can only REDUCE the conv, freq and
+    cross-dim counts, so the max_* ceilings cannot be broken either.
+
+    A genome with fewer blocks than the floor has all of its blocks converted and
+    is left at that: the alternative is growing the genome past max_blocks. The
+    result is still buildable, which is what matters -- a genome that fails to
+    build scores inf and reads as a bad architecture.
+    """
+    if constraints is None:
+        return
+    need = int(getattr(constraints, "min_quantum_blocks", 0) or 0)
+    if need <= 0:
+        return
+
+    blocks = [b for st in genome.stages for b in st.blocks]
+    have = sum(1 for b in blocks if b.block_type == "quantum")
+    if have >= need:
+        return
+
+    candidates = [b for b in blocks if b.block_type != "quantum"]
+    random.shuffle(candidates)
+    for b in candidates[: need - have]:
+        b.block_type = "quantum"
+
+
 def _random_block(ss: SearchSpaceConfig) -> BlockSpec:
     return BlockSpec(
         block_type=random.choice(ss.block_types),
@@ -80,7 +111,7 @@ def _allowed_tokenizers_for_family(family: str) -> set[str]:
     return {"time", "var", "patch", "cross"}
 
 
-def repair_genome(genome: Genome, ss: SearchSpaceConfig) -> Genome:
+def repair_genome(genome: Genome, ss: SearchSpaceConfig, constraints=None) -> Genome:
     """
     Enforces structural invariants on a v2 genome:
       - stages exists and has >= 1 stage
@@ -92,6 +123,12 @@ def repair_genome(genome: Genome, ss: SearchSpaceConfig) -> Genome:
       - num_heads derived from model_dim (head_dim = 8)
       - ff_mult, dropout clamped to range
       - head params clamped to search space
+      - at least constraints.min_quantum_blocks quantum blocks, when constraints
+        are supplied and that floor is above zero
+
+    constraints is optional so every existing caller keeps working; without it
+    the quantum floor simply is not enforced, which is the behaviour of every
+    config that does not set one.
     """
 
     # 1) Ensure stages exist
@@ -187,6 +224,10 @@ def repair_genome(genome: Genome, ss: SearchSpaceConfig) -> Genome:
                 genome.conv_block.kernel_size = random.choice(list(ss.conv_kernel_sizes))
             if hasattr(ss, "conv_dilations") and genome.conv_block.dilation not in ss.conv_dilations:
                 genome.conv_block.dilation = random.choice(list(ss.conv_dilations))
+
+    # 8b) Force a minimum number of quantum blocks, before the gene repair below
+    # reads the block types to decide whether the quantum block is enabled.
+    _enforce_min_quantum_blocks(genome, constraints)
 
     # 9) Repair quantum_block params
     was_q_enabled = genome.quantum_block.enabled

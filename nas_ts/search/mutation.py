@@ -244,5 +244,5 @@ def mutate_genome(
     # -------------------------
     # final repair (enforces invariants + enables heads if needed)
     # -------------------------
-    g = repair_genome(g, ss)
+    g = repair_genome(g, ss, constraints)
     return g

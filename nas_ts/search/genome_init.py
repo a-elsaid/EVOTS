@@ -81,4 +81,4 @@ def random_genome(
         stages=_random_stages(ss, depth, family),
     )
 
-    return repair_genome(g, ss)
+    return repair_genome(g, ss, constraints)
