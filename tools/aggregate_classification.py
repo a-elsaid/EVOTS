@@ -100,6 +100,55 @@ def is_evots(system: str) -> bool:
     return system.startswith(f"{EVOTS_SYSTEM} (")
 
 
+def count_quantum_blocks(record: dict):
+    """
+    Quantum blocks in this run's winning genome, or None when unknowable.
+
+    A quantum condition whose winners contain no quantum block is measuring
+    classical architectures with a quantum budget. That has to be visible in the
+    table rather than inferred from the config directory that produced it.
+
+    None (not 0) when there is no genome to count -- a baseline, a failed run, a
+    record from before best_genome was written. 0 means "a genome, and it has no
+    quantum block", which is the finding worth surfacing.
+
+    Malformed entries are skipped and warned about rather than raised on. This
+    reads files written by runs that took days on a cluster; one damaged record
+    must not take down the whole table, and a silent skip would understate the
+    count with nothing to show for it.
+    """
+    genome = record.get("best_genome")
+    if not isinstance(genome, dict):
+        return None
+    stages = genome.get("stages")
+    if not isinstance(stages, list):
+        return None
+
+    n, skipped = 0, 0
+    for stage in stages:
+        if not isinstance(stage, dict):
+            skipped += 1
+            continue
+        blocks = stage.get("blocks")
+        if not isinstance(blocks, list):
+            if blocks is not None:
+                skipped += 1
+            continue
+        for block in blocks:
+            if not isinstance(block, dict):
+                skipped += 1
+                continue
+            if block.get("block_type") == "quantum":
+                n += 1
+
+    if skipped:
+        run = record.get("run_name") or "<unnamed run>"
+        print(f"[Aggregate] {run}: skipped {skipped} malformed genome entr"
+              f"{'y' if skipped == 1 else 'ies'} while counting quantum blocks; "
+              f"the count for this run may be low.", file=sys.stderr)
+    return n
+
+
 def summarise(values):
     if not values:
         return None
@@ -119,7 +168,8 @@ def collect(records, datasets, split_modes, seeds, undeclared=None):
     Every run is accounted for: ok runs feed the statistics, failed runs are
     counted and named, and seeds with no run at all are reported missing.
     """
-    ok = defaultdict(lambda: {"accuracy": [], "macro": [], "seeds": set()})
+    ok = defaultdict(lambda: {"accuracy": [], "macro": [], "seeds": set(),
+                              "qblocks": []})
     failed = defaultdict(list)
 
     for path, rec in records:
@@ -143,13 +193,22 @@ def collect(records, datasets, split_modes, seeds, undeclared=None):
         seed = rec.get("data_split_seed")
         if seed is not None:
             ok[key]["seeds"].add(int(seed))
+        nq = count_quantum_blocks(rec)
+        if nq is not None:
+            ok[key]["qblocks"].append(nq)
 
     cells = {}
     for key in set(ok) | set(failed):
-        got = ok.get(key, {"accuracy": [], "macro": [], "seeds": set()})
+        got = ok.get(key, {"accuracy": [], "macro": [], "seeds": set(),
+                           "qblocks": []})
+        q = got["qblocks"]
         cells[key] = {
             "accuracy": summarise(got["accuracy"]),
             "macro": summarise(got["macro"]),
+            # None when no run in this cell had a genome to count (baselines).
+            "quantum": ({"mean": sum(q) / len(q),
+                         "zero_fraction": sum(1 for x in q if x == 0) / len(q),
+                         "n": len(q)} if q else None),
             "failed": failed.get(key, []),
             "missing_seeds": sorted(set(seeds) - got["seeds"]) if seeds else [],
         }
@@ -160,8 +219,17 @@ def exaqc_cell(dataset: str):
     values = EXAQC_TABLE1.get(dataset)
     if not values:
         return None
+    # No genome to inspect: these are published numbers, not runs of ours.
     return {"accuracy": summarise(values), "macro": summarise(values),
-            "failed": [], "missing_seeds": []}
+            "quantum": None, "failed": [], "missing_seeds": []}
+
+
+def fmt_quantum(cell) -> str:
+    """Mean quantum blocks in the winning genome, and how often there were none."""
+    q = (cell or {}).get("quantum")
+    if not q:
+        return "--"
+    return f"{q['mean']:.1f} ({q['zero_fraction']:.0%} none)"
 
 
 def fmt(summary, note=""):
@@ -212,7 +280,8 @@ def write_csv(rows, path: Path):
         w.writerow(["dataset", "split_mode", "system", "comparable_to_exaqc",
                     "n_runs", "accuracy_mean", "accuracy_std", "accuracy_best",
                     "accuracy_worst", "macro_mean", "macro_std", "macro_best",
-                    "macro_worst", "n_failed", "missing_seeds", "notes"])
+                    "macro_worst", "quantum_blocks_mean", "quantum_blocks_zero_fraction",
+                    "n_failed", "missing_seeds", "notes"])
         for r in rows:
             a, m, c = r["cell"]["accuracy"], r["cell"]["macro"], r["cell"]
             w.writerow([
@@ -223,6 +292,8 @@ def write_csv(rows, path: Path):
                 f"{a['best']:.4f}" if a else "", f"{a['worst']:.4f}" if a else "",
                 f"{m['mean']:.4f}" if m else "", f"{m['std']:.4f}" if m else "",
                 f"{m['best']:.4f}" if m else "", f"{m['worst']:.4f}" if m else "",
+                f"{c['quantum']['mean']:.4f}" if c.get("quantum") else "",
+                f"{c['quantum']['zero_fraction']:.4f}" if c.get("quantum") else "",
                 len(c["failed"]),
                 " ".join(str(s) for s in c["missing_seeds"]),
                 r["note"].strip(),
@@ -251,6 +322,15 @@ def write_markdown(rows, path: Path, problems):
         "with no condition recorded is counted as `classical` and listed under "
         "*Runs not included* so it can be checked.",
         "",
+        "**Quantum blocks** is the mean number of quantum blocks in each run's "
+        "WINNING genome, with the fraction of runs whose winner had none. It is "
+        "blank where there is no genome to inspect (baselines, and EXAQC's "
+        "published figures). In a quantum condition the search is free to reject "
+        "quantum blocks entirely: a high `none` fraction means that row is "
+        "largely reporting classical architectures that happened to be found "
+        "under a quantum budget, and should not be read as a result about "
+        "quantum circuits.",
+        "",
         "Baseline rows marked `[no tuning]` got no hyperparameter selection, "
         "because in that mode validation *is* test and selecting there would be "
         "selecting on test. EvoTS does select on that holdout in `exaqc` mode, "
@@ -259,15 +339,15 @@ def write_markdown(rows, path: Path, problems):
     ]
     for dataset in dict.fromkeys(r["dataset"] for r in rows):
         lines += [f"## {dataset}", "",
-                  "| Split mode | System | Accuracy % | Macro accuracy % | Runs | Failed | Missing seeds |",
-                  "|---|---|---|---|---|---|---|"]
+                  "| Split mode | System | Accuracy % | Macro accuracy % | Quantum blocks | Runs | Failed | Missing seeds |",
+                  "|---|---|---|---|---|---|---|---|"]
         for r in (x for x in rows if x["dataset"] == dataset):
             c = r["cell"]
             n = (c["accuracy"] or {}).get("n", 0)
             lines.append(
                 f"| {r['split_mode']} | {r['system']}{r['note']} | "
-                f"{fmt(c['accuracy'])} | {fmt(c['macro'])} | {n} | "
-                f"{len(c['failed'])} | "
+                f"{fmt(c['accuracy'])} | {fmt(c['macro'])} | "
+                f"{fmt_quantum(c)} | {n} | {len(c['failed'])} | "
                 f"{', '.join(str(s) for s in c['missing_seeds']) or '--'} |")
         lines.append("")
 

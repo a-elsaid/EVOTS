@@ -152,6 +152,23 @@ def crossover_genome(
         pos_encoding=str(random.choice([parent1.pos_encoding, parent2.pos_encoding])),
         dropout=float(random.choice([parent1.dropout, parent2.dropout])),
         stages=child_stages,
+        # Every genome-level spec is inherited from one parent or the other,
+        # chosen independently per spec, exactly as the scalar fields above are.
+        #
+        # Deep-copied, not referenced: the child goes on to be mutated, and a
+        # shared spec object would rewrite the parent still sitting in the
+        # population.
+        #
+        # Omitting any of these gives the child a default spec that repair_genome
+        # then re-randomises, so the gene is not inherited at all -- two parents
+        # that agree on a value produce children that do not, and the search
+        # resamples the spec on every child instead of converging on it.
+        var_head=copy.deepcopy(random.choice([parent1.var_head, parent2.var_head])),
+        cross_head=copy.deepcopy(random.choice([parent1.cross_head, parent2.cross_head])),
+        conv_block=copy.deepcopy(random.choice([parent1.conv_block, parent2.conv_block])),
+        quantum_block=copy.deepcopy(
+            random.choice([parent1.quantum_block, parent2.quantum_block])
+        ),
     )
 
-    return repair_genome(child, ss)
+    return repair_genome(child, ss, constraints)

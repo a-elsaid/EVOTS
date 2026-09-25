@@ -133,6 +133,42 @@ class SearchSpaceConfig:
     quantum_gate_sets: List[str] = field(default_factory=lambda: ["rx_ry", "rx_ry_rz"])
     quantum_use_ffn_options: List[bool] = field(default_factory=lambda: [True, False])
 
+    # Qubit ranges set from measurement, not guesswork. Simulation cost is 2^n
+    # complex amplitudes per token, vmapped over B*N tokens, so an over-wide range
+    # makes workers run out of memory. A Python-level allocation failure is caught
+    # and scores that genome inf, indistinguishable from a genuinely bad
+    # architecture; a native OOM kills the worker, breaks the process pool and
+    # takes down the whole run, which the suite then records as failed.
+    #
+    # MEASURED ON CPU (Apple Silicon laptop), at breast-cancer scale: batch 32,
+    # 30 tokens per sample, d_model 256, so 960 tokens per vmapped call — the
+    # widest of the four classification datasets. Figures are one full training
+    # evaluation (200 epochs x 13 batches) with a single quantum block in the
+    # model, against a classical genome of the same shape:
+    #
+    #   amplitude  n=8   21.5 min  1.1 GB   0.9x classical
+    #   amplitude  n=12  42.4 min  1.8 GB   1.7x        (expval_z: 62 min, 2.4 GB)
+    #   amplitude  n=14 145.8 min  3.8 GB   5.9x        (expval_z: 316 min, 8.6 GB)
+    #   angle      n=12  22.1 min  1.3 GB   0.9x
+    #   angle      n=14  26.5 min  2.1 GB   1.1x        (expval_z: 138 min, 7.7 GB)
+    #
+    # Amplitude stops at 12: at 14 it costs 6-13x a classical genome and peaks at
+    # 3.8-8.6 GB per worker, which is 42-95 GB across the 11 workers the configs
+    # request. Angle reaches 14 for ~1x, because its input projection is
+    # d_model -> n rather than d_model -> 2^n; that asymmetry is why the two
+    # encodings get separate ranges rather than one shared one.
+    #
+    # The cluster runs on GPU, where the arithmetic is far cheaper relative to
+    # memory traffic, so these ratios will not carry over directly — expect the
+    # wall-clock multipliers to shrink and the memory ceiling to bind sooner (GPU
+    # RAM per worker is smaller than host RAM). Re-measure with
+    # tools/bench_quantum.py --device cuda before trusting either bound there.
+    quantum_encodings: List[str] = field(default_factory=lambda: ["amplitude", "angle"])
+    quantum_readouts: List[str] = field(default_factory=lambda: ["state", "prob", "expval_z"])
+    quantum_amplitude_qubits_range: Tuple[int, int] = (4, 12)
+    quantum_angle_qubits_range: Tuple[int, int] = (4, 14)
+    quantum_reupload_options: List[bool] = field(default_factory=lambda: [True, False])
+
     # ---- Stages (for genome_v2) ----
     stage_count_range: Tuple[int, int] = (1, 3)
     stage_tokenizers: List[str] = field(default_factory=lambda: ["time", "var", "patch", "cross"])
@@ -170,6 +206,14 @@ class GenomeConstraints:
     max_conv_blocks: int = 4
     max_freq_blocks: int = 4
     max_cross_dim_blocks: int = 4
+
+    # Floor on quantum blocks per genome. 0 (the default) leaves the search free
+    # to reject quantum entirely, which is what every existing config does.
+    # Setting it to 1 or more forces every genome to contain a circuit, turning
+    # "is a circuit useful here" into "what is the best circuit-containing
+    # architecture" -- a different question, so it gets its own config directory
+    # rather than changing the free condition.
+    min_quantum_blocks: int = 0
 
 
 @dataclass

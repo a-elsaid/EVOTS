@@ -116,6 +116,19 @@ class QuantumBlockSpec:
     gate_set: str = "rx_ry"            # "rx_ry" | "rx_ry_rz"
     use_ffn: bool = True                # append FFN after the quantum residual
 
+    # Circuit genes. model_builder_v2 has always read these off the spec via
+    # getattr with exactly these defaults, so a genome that leaves them alone
+    # builds the same block it did before they existed.
+    encoding: str = "amplitude"         # "amplitude" | "angle"
+    readout: str = "state"              # "state" | "prob" | "expval_z"
+    # 0 means "derive from d_model" and is valid ONLY for amplitude encoding,
+    # which then needs d_model to be a power of two. Angle encoding raises at
+    # build time on 0, so repair_genome must assign a real width whenever the
+    # encoding is angle -- a build failure there scores inf and is
+    # indistinguishable from a genuinely bad architecture.
+    n_qubits: int = 0
+    reupload: bool = False              # re-encode the input at every circuit layer
+
 
 # ----------------------------
 # NEW: StageSpec
@@ -334,7 +347,11 @@ class Genome:
             f"nlayers={self.quantum_block.nlayers}, "
             f"entangle={self.quantum_block.entangle_pattern}, "
             f"gate_set={self.quantum_block.gate_set}, "
-            f"use_ffn={self.quantum_block.use_ffn}"
+            f"use_ffn={self.quantum_block.use_ffn}, "
+            f"encoding={self.quantum_block.encoding}, "
+            f"readout={self.quantum_block.readout}, "
+            f"n_qubits={self.quantum_block.n_qubits}, "
+            f"reupload={self.quantum_block.reupload}"
         )
 
         # stages
