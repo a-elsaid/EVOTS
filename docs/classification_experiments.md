@@ -81,23 +81,106 @@ PYTHONPATH=$PWD python tools/aggregate_classification.py \
 cat logs/smoke/comparison.md
 ```
 
-If that prints a table, the pipeline works. The numbers are meaningless at this
-budget — 4 genomes, 3 epochs.
+If that prints a table, the classical pipeline works. The numbers are meaningless
+at this budget — 4 genomes, 3 epochs.
 
-## 4. The full run
+### ... and one for the quantum conditions
+
+Worth running before committing cluster time: it is the only check that
+`tensorcircuit` imports, that circuits compile, and that the quantum configs are
+where the suite expects them. Takes a couple of minutes, mostly circuit compilation.
 
 ```bash
-PYTHONPATH=$PWD python experiments/run_classification_suite.py
+PYTHONPATH=$PWD python experiments/run_classification_suite.py \
+  --condition quantum --config-dir configs/classification_quantum \
+  --datasets iris --seeds 0 --split-modes clean --out-dir logs/smoke \
+  --set eval.device=cpu --set evo.num_workers=1 \
+  --set evo.max_evals=4 --set eval.training_steps=3 \
+  --set evo.population_size=4 --set eval.extra_training_steps=50
+
+PYTHONPATH=$PWD python experiments/run_classification_suite.py \
+  --condition quantum-forced --config-dir configs/classification_quantum_forced \
+  --datasets iris --seeds 0 --split-modes clean --out-dir logs/smoke \
+  --set eval.device=cpu --set evo.num_workers=1 \
+  --set evo.max_evals=4 --set eval.training_steps=3 \
+  --set evo.population_size=4 --set eval.extra_training_steps=50
+
+PYTHONPATH=$PWD python tools/aggregate_classification.py \
+  --results-dir logs/smoke --datasets iris --split-modes clean --seeds 0
+cat logs/smoke/comparison.md
 ```
 
-That is 4 datasets x 2 split modes x 10 seeds = **80 runs**, each a full
-EXAQC-matched search (500 genomes, population 50, 200 epochs per genome). Every run
-is a separate subprocess, so one crash kills one run, not the sweep.
+The table should now show `EvoTS (classical)`, `EvoTS (quantum)` and
+`EvoTS (quantum-forced)` as separate rows, with a non-blank **Quantum blocks**
+column on the two quantum rows.
+
+## 4. The full run — three conditions
+
+There are three EvoTS conditions. Each is a separate sweep with its own config
+directory and its own `--condition` label; the label becomes part of every run
+name and its own row in the comparison table.
+
+**Run them in this order, all into the same `--out-dir`, and aggregate last:**
+
+```bash
+OUT=logs/classification
+
+# 1. classical: no quantum blocks in the search space
+PYTHONPATH=$PWD python experiments/run_classification_suite.py \
+  --out-dir $OUT
+
+# 2. quantum (free): quantum joins block_types, the search may or may not use it
+PYTHONPATH=$PWD python experiments/run_classification_suite.py \
+  --condition quantum --config-dir configs/classification_quantum \
+  --out-dir $OUT
+
+# 3. quantum-forced: every genome carries at least one quantum block
+PYTHONPATH=$PWD python experiments/run_classification_suite.py \
+  --condition quantum-forced --config-dir configs/classification_quantum_forced \
+  --out-dir $OUT
+
+# 4. baselines — ONCE, not per condition (see section 5)
+PYTHONPATH=$PWD python tools/classical_baselines.py --out-dir $OUT
+
+# 5. the table — LAST, after everything above
+PYTHONPATH=$PWD python tools/aggregate_classification.py --results-dir $OUT
+```
+
+Each sweep is 4 datasets x 2 split modes x 10 seeds = **80 runs**, each a full
+EXAQC-matched search (500 genomes, population 50, 200 epochs per genome), so all
+three conditions together are 240 runs. Every run is a separate subprocess, so one
+crash kills one run, not the sweep.
+
+Three things that are easy to get wrong:
+
+- **One `--out-dir` for everything.** Run names are condition-prefixed
+  (`classical_iris_clean_seed0`, `quantum_iris_clean_seed0`, ...) so they cannot
+  collide, and the aggregation needs every condition and the baselines in one
+  directory to build a single table. Separate directories give you three
+  single-row tables instead of one comparison.
+- **Aggregate last.** It reads whatever is present; run it early and rows are
+  simply missing. It is cheap and re-runnable, so run it again whenever more
+  results land.
+- **Conditions are independent sweeps.** You can run them on different days, or
+  only some of them; the table shows whatever exists and lists the rest under
+  *Runs not included*.
 
 Exit code is non-zero if any run failed, so a scheduler will notice.
 
-Under a job scheduler, wrap it in your usual submission script and give it plenty of
-walltime. If the job is killed, just submit it again — see resuming below.
+Under a job scheduler, wrap each condition in your usual submission script and give
+it plenty of walltime. If a job is killed, just submit it again — see resuming below.
+
+### What the three conditions answer
+
+| Condition | Config directory | Question it answers |
+|---|---|---|
+| `classical` | `configs/classification` | How good is a searched transformer here? |
+| `quantum` | `configs/classification_quantum` | Is a quantum circuit useful **when the search may decline it**? |
+| `quantum-forced` | `configs/classification_quantum_forced` | What is the best **circuit-containing** architecture? |
+
+The free `quantum` condition does not guarantee a quantum block: `block_types` has
+four entries, so about 28% of freshly sampled genomes contain none, and selection
+can push that higher if circuits do not pay for themselves. See section 9.
 
 ### Subsets
 
@@ -124,10 +207,16 @@ survives as evidence. The aggregation ignores those folders.
 
 To force a completed run to re-execute, add `--force`.
 
-## 5. Classical baselines
+## 5. Classical baselines — run once, not per condition
 
 Logistic regression, SVC (RBF) and a small MLP, on **exactly** the same splits —
 they are built by calling EvoTS's own data loader, not a reimplementation.
+
+**These are condition-independent.** They do not use the EvoTS search at all, so
+they are identical whichever conditions you ran; the aggregation keys them by model
+(`model_family: classical_baseline`), not by condition. Running them again after
+each sweep just recomputes the same numbers, and re-running them is harmless but
+pointless.
 
 ```bash
 PYTHONPATH=$PWD python tools/classical_baselines.py
@@ -150,6 +239,12 @@ Writes three files next to the results (or wherever `--out-dir` points):
 | `comparison.md` | read it |
 | `comparison.csv` | further analysis |
 | `comparison.tex` | paste into the paper |
+
+Columns: accuracy and macro (mean-class) accuracy as `mean ± std (best, worst, n)`,
+then **Quantum blocks** — the mean number of quantum blocks in each run's winning
+genome with the fraction of winners that had none, blank for baselines and for
+EXAQC. Read that column before the accuracies on any quantum row; section 9
+explains why.
 
 Each cell is `mean ± std (best, worst, n)` for accuracy and macro (mean-class)
 accuracy, next to EXAQC's published numbers. **Failed and missing runs are listed
@@ -184,7 +279,26 @@ each, which is four orders of magnitude more compute, on different hardware.
 
 What I can say: the four datasets are small (150-569 rows), each genome trains in
 seconds to low minutes on CPU at this scale, and the search runs 11 workers in
-parallel by default (matching EXAQC). **Run one cell first and time it**, then
+parallel by default (matching EXAQC). **Quantum conditions are far slower than classical.** On the two-minute smoke
+above, the same budget took ~8x longer for the quantum condition than the
+classical one (61 s vs 8 s), and the forced condition longer still, because every
+genome carries a circuit. At real budget the multiplier depends on how many
+quantum blocks each genome ends up with:
+
+| quantum blocks in a genome | min/evaluation | peak GB |
+|---|---|---|
+| 0 (classical) | 25.6 | 0.6 |
+| 1 | 42.6 | 1.8 |
+| 2 | 63.6 | 1.9 |
+| 4 | 99.8 | 2.0 |
+
+Measured on CPU at breast-cancer scale with amplitude encoding at 12 qubits. Cost
+grows roughly linearly with the number of quantum blocks; peak memory plateaus,
+because every block in a genome shares one compiled circuit. Budget the quantum
+conditions at **2-4x the classical wall clock**, and the forced condition at the
+upper end of that.
+
+**Run one cell first and time it**, then
 multiply by 80:
 
 ```bash
@@ -208,23 +322,57 @@ The label goes into every run name and becomes the row key in the comparison tab
 sweep rather than starting a parallel one. Anything outside `[a-z0-9-]+` is rejected
 with exit code 2 rather than quietly creating a second set of rows.
 
-### Quantum configs go in their own directory, with the same four filenames
+### Each condition's configs live in their own directory, under the same four filenames
 
-The suite looks up `<config-dir>/<dataset>.yml`. So a quantum sweep needs:
+The suite looks up `<config-dir>/<dataset>.yml`, so every condition needs the same
+four filenames in a different directory — never `iris_quantum.yml`:
 
 ```
-configs/classification_quantum/{iris,wine,seeds,breast_cancer}.yml
+configs/classification/{iris,wine,seeds,breast_cancer}.yml                  # classical
+configs/classification_quantum/{iris,wine,seeds,breast_cancer}.yml          # quantum
+configs/classification_quantum_forced/{iris,wine,seeds,breast_cancer}.yml   # quantum-forced
 ```
 
-— the same four filenames, in a different directory. Not `iris_quantum.yml`.
+The suite stops with exit 2 if a config is missing from the directory you point it
+at, rather than failing 80 times in a row.
 
-```bash
-python experiments/run_classification_suite.py \
-  --condition quantum --config-dir configs/classification_quantum
+### In the free quantum condition, the search may reject quantum entirely
+
+`block_types` in the quantum configs is `["attn", "inv_attn", "conv", "quantum"]`,
+so each block is quantum with probability about 1/4 and **roughly 28% of freshly
+sampled genomes contain no quantum block at all**. Nothing requires one. Selection
+can push that fraction either way, and since a quantum block costs 2-4x a classical
+one for no guaranteed accuracy gain, it may well push it toward 100%.
+
+That is a legitimate result — "the search declined to use circuits" is worth
+knowing — but it changes how the row must be read. **A quantum row whose winners
+contain no quantum blocks is reporting classical architectures that happened to be
+found under a quantum budget.** It is not evidence about quantum circuits either
+way.
+
+The comparison table makes this visible: the **Quantum blocks** column gives the
+mean number of quantum blocks in each run's winning genome, with the fraction of
+runs whose winner had none.
+
+```
+| clean | EvoTS (classical)       | ... | 0.0 (100% none) |
+| clean | EvoTS (quantum)         | ... | 2.0 (0% none)   |
+| clean | EvoTS (quantum-forced)  | ... | 1.5 (0% none)   |
+| clean | logreg                  | ... | --              |
 ```
 
-The suite stops with exit 2 if a config is missing from that directory, rather than
-failing 80 times in a row.
+Read it before reading the accuracies:
+
+- **`0.0 (100% none)`** on a quantum row — the search rejected quantum. Compare
+  that row against `classical`, not against EXAQC's circuits.
+- **a high `none` fraction, say 60%** — the row mixes quantum and classical
+  winners, and its mean accuracy is an average over two different model families.
+- **`(0% none)`** — every winner used a circuit; the row means what it appears to.
+
+`quantum-forced` exists for exactly this reason: `constraints.min_quantum_blocks: 1`
+guarantees every genome carries a circuit, so that row always answers "best
+circuit-containing architecture" and can never quietly become a classical row. The
+blank `--` on baseline and EXAQC rows means there is no genome of ours to inspect.
 
 ### A whole run is bit-reproducible only at `num_workers=1`
 
@@ -240,6 +388,41 @@ failing 80 times in a row.
 For the experiments this is fine — the seeds give you a distribution, not one
 canonical run. If you need an exactly reproducible run for debugging, add
 `--set evo.num_workers=1` and expect it to be much slower.
+
+### Memory per worker, and why the qubit ranges are capped
+
+Simulating an n-qubit circuit holds 2^n complex amplitudes **per token**, vmapped
+over batch x tokens. Peak memory per worker, measured on CPU at breast-cancer scale
+(960 tokens per call):
+
+| encoding / readout | n=12 | n=14 |
+|---|---|---|
+| amplitude / state | 1.8 GB | 3.8 GB |
+| amplitude / expval_z | 2.4 GB | 8.6 GB |
+| angle / state | 1.3 GB | 2.1 GB |
+| angle / expval_z | 2.5 GB | 7.7 GB |
+
+The configs request **11 workers**, so multiply by 11 for the node: 8.6 GB per
+worker is ~95 GB. That is why `quantum_amplitude_qubits_range` stops at 12, and why
+breast cancer caps angle at 12 while the smaller datasets allow 14.
+
+A worker that runs out of memory dies, and the suite records that genome as `inf`
+fitness — **indistinguishable from a genuinely bad architecture**. If a quantum
+sweep produces suspiciously many `inf` results, suspect memory before suspecting
+the search.
+
+**These are CPU figures and the cluster runs on GPU.** Expect the wall-clock
+multipliers to shrink (the arithmetic parallelises well) but the memory ceiling to
+bind *sooner*, because GPU RAM per worker is smaller than host RAM. Re-measure
+before trusting either bound there:
+
+```bash
+PYTHONPATH=$PWD python tools/bench_quantum.py --device cuda --backward \
+  --qubits 8,10,12,14 --batch 32 --tokens 30
+```
+
+If GPU memory is tight, the lever is the qubit range in the config, or
+`evo.num_workers`, not the circuit cache.
 
 ### Keep seeds below about 2000
 
